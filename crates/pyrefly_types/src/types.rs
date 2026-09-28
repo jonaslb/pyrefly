@@ -1764,13 +1764,16 @@ impl Type {
                 {
                     *ty = w;
                 }
-            } else if let Type::Forall(forall) = ty {
-                let old_len = shadowed.len();
-                shadowed.extend(forall.tparams.iter().cloned());
-                ty.recurse_mut(&mut |x| f(x, mp, shadowed));
-                shadowed.truncate(old_len);
-            } else if let Type::TypeLevelDslCall(call) = ty {
-                call.subst_parts_mut(shadowed, &mut |x, shadowed| f(x, mp, shadowed));
+            } else if matches!(
+                ty,
+                Type::Forall(_)
+                    | Type::Overload(_)
+                    | Type::BoundMethod(_)
+                    | Type::TypeLevelDslCall(_)
+            ) {
+                ty.recurse_with_type_parameter_scopes_mut(shadowed, &mut |x, shadowed| {
+                    f(x, mp, shadowed)
+                });
             } else {
                 ty.recurse_mut(&mut |x| f(x, mp, shadowed));
             }
@@ -2617,6 +2620,51 @@ mod tests {
             Type::Quantified(Box::new(q.clone())),
         )));
         assert_eq!(free_quantifieds(&map), vec![q]);
+    }
+
+    #[test]
+    fn test_substitution_respects_overload_and_method_binders() {
+        let q = test_quantified("test.substitution", "T");
+        let q_type = Type::Quantified(Box::new(q.clone()));
+        let bound_function = Forall {
+            tparams: Arc::new(TParams::new(vec![q.clone()])),
+            body: test_function(q_type.clone()),
+        };
+        let mut overload = Type::Overload(Overload {
+            signatures: vec1![
+                OverloadType::Forall(bound_function.clone()),
+                OverloadType::Function(test_function(q_type.clone())),
+            ],
+            metadata: Box::new(FuncMetadata {
+                kind: FunctionKind::Overload,
+                flags: FuncFlags::default(),
+            }),
+        });
+        overload.subst_mut_fn(&mut |candidate| (candidate == &q).then_some(Type::None));
+        let Type::Overload(overload) = overload else {
+            unreachable!();
+        };
+        assert_eq!(
+            overload.signatures[0],
+            OverloadType::Forall(bound_function.clone())
+        );
+        assert_eq!(
+            overload.signatures[1],
+            OverloadType::Function(test_function(Type::None))
+        );
+
+        let mut method = Type::BoundMethod(Box::new(BoundMethod {
+            obj: q_type,
+            func: BoundMethodType::Forall(bound_function.clone()),
+        }));
+        method.subst_mut_fn(&mut |candidate| (candidate == &q).then_some(Type::None));
+        assert_eq!(
+            method,
+            Type::BoundMethod(Box::new(BoundMethod {
+                obj: Type::None,
+                func: BoundMethodType::Forall(bound_function),
+            }))
+        );
     }
 
     /// `display_name` is presentation-only, so two unions with identical members
