@@ -77,6 +77,7 @@ mod quantified_containers;
 mod quantified_diagnostics;
 mod quantified_helpers;
 mod quantified_narrow;
+mod quantified_overloads;
 mod query;
 mod recursive_alias;
 mod redundant_cast;

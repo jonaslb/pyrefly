@@ -6,6 +6,7 @@
  */
 
 use std::cmp::max;
+use std::ptr::eq as ptr_eq;
 
 use itertools::Either;
 use itertools::Itertools;
@@ -85,12 +86,81 @@ impl CalledOverload<'_> {
     }
 }
 
+/// Specializes the free occurrences of `q` in the signature of `target` to its `index`-th
+/// constraint. A quantified bound by the target's own type parameters is distinct and left alone.
+fn specialize_target(
+    mut target: TargetWithTParams<Function>,
+    q: &Quantified,
+    index: usize,
+) -> TargetWithTParams<Function> {
+    if target
+        .0
+        .as_ref()
+        .is_some_and(|ts| ts.iter().any(|t| t == q))
+    {
+        return target;
+    }
+    target.1.signature =
+        match Type::Callable(Box::new(target.1.signature)).specialize_quantified(q, index) {
+            Type::Callable(c) => *c,
+            _ => unreachable!("specialization only replaces nested type variables"),
+        };
+    target
+}
+
+/// The choice that produced one expanded argument list at one expansion step: the index of a
+/// union member, or the index of a declared constraint of a constrained quantified.
+#[derive(Clone, Debug)]
+pub struct ExpansionChoice {
+    quantified: Option<Quantified>,
+    index: usize,
+}
+
+/// An argument list produced by argument type expansion, together with the choices made at each
+/// expansion step, in the order in which the steps were made.
+#[derive(Clone, Debug)]
+pub struct ExpandedArgs<'a> {
+    pub args: Vec<CallArg<'a>>,
+    pub keywords: Vec<CallKeyword<'a>>,
+    pub choices: Vec<ExpansionChoice>,
+}
+
+impl ExpandedArgs<'_> {
+    fn has_quantified_choices(&self) -> bool {
+        self.choices.iter().any(|c| c.quantified.is_some())
+    }
+
+    /// Specializes the free occurrences of chosen quantifieds in the signature of `target`.
+    fn specialize_target(
+        &self,
+        target: &TargetWithTParams<Function>,
+    ) -> TargetWithTParams<Function> {
+        self.choices
+            .iter()
+            .fold(target.clone(), |target, choice| match &choice.quantified {
+                Some(q) => specialize_target(target, q, choice.index),
+                None => target,
+            })
+    }
+
+    /// Specializes `ty` to the constraints chosen for quantifieds while producing this list.
+    fn specialize(&self, ty: Type) -> Type {
+        self.choices
+            .iter()
+            .fold(ty, |ty, choice| match &choice.quantified {
+                Some(q) => ty.specialize_quantified(q, choice.index),
+                None => ty,
+            })
+    }
+}
+
 /// Performs argument type expansion for arguments to an overloaded function.
 pub struct ArgsExpander<'a, Ans: LookupAnswer> {
     /// The index of the next argument to expand. Left is positional args; right, keyword args.
     idx: Either<usize, usize>,
-    /// Current argument lists.
-    arg_lists: Vec<(Vec<CallArg<'a>>, Vec<CallKeyword<'a>>)>,
+    /// Current argument lists. Lists are in expansion order: the choice of the most recent step
+    /// varies fastest, so lists sharing a prefix of choices are contiguous.
+    arg_lists: Vec<ExpandedArgs<'a>>,
     /// Hard-coded limit to how many times we'll expand.
     gas: Gas,
     solver: &'a AnswersSolver<'a, 'a, Ans>,
@@ -110,7 +180,11 @@ impl<'a, Ans: LookupAnswer> ArgsExpander<'a, Ans> {
             } else {
                 Either::Left(0)
             },
-            arg_lists: vec![(posargs, keywords)],
+            arg_lists: vec![ExpandedArgs {
+                args: posargs,
+                keywords,
+                choices: Vec::new(),
+            }],
             gas: Gas::new(Self::GAS as isize),
             solver,
         }
@@ -122,69 +196,138 @@ impl<'a, Ans: LookupAnswer> ArgsExpander<'a, Ans> {
         errors: &ErrorCollector,
         owner: &'a Owner<Type>,
     ) -> Option<Vec<(Vec<CallArg<'a>>, Vec<CallKeyword<'a>>)>> {
+        Some(
+            self.expand_impl(errors, owner, None)?
+                .into_map(|x| (x.args, x.keywords)),
+        )
+    }
+
+    /// Like `expand`, but an argument whose type is a constrained quantified `q`, or depends on
+    /// one, is expanded by specializing `q` to each declared constraint in every argument of the
+    /// list. Occurrences of `q` in other arguments therefore stay consistent with the choice, and
+    /// the recorded choices identify `q` so that results can be reassembled into cases over `q`.
+    pub fn expand_correlated(
+        &mut self,
+        errors: &ErrorCollector,
+        owner: &'a Owner<Type>,
+        call: &'a CallWithTypes,
+    ) -> Option<Vec<ExpandedArgs<'a>>> {
+        self.expand_impl(errors, owner, Some(call))
+    }
+
+    fn expand_impl(
+        &mut self,
+        errors: &ErrorCollector,
+        owner: &'a Owner<Type>,
+        call: Option<&'a CallWithTypes>,
+    ) -> Option<Vec<ExpandedArgs<'a>>> {
         let idx = self.idx;
-        let (posargs, keywords) = self.arg_lists.first()?;
-        // Determine the value to try expanding, and also the idx of the value we will try next if needed.
-        let value = match idx {
-            Either::Left(i) => match &posargs[i] {
-                CallArg::Arg(value) | CallArg::Star(value, ..) => {
-                    self.idx = if i < posargs.len() - 1 {
-                        Either::Left(i + 1)
-                    } else {
-                        Either::Right(0)
-                    };
-                    value
-                }
-            },
-            Either::Right(i) if i < keywords.len() => {
-                let CallKeyword { value, .. } = &keywords[i];
-                self.idx = Either::Right(i + 1);
-                value
-            }
-            Either::Right(_) => {
-                return None;
-            }
+        let first = self.arg_lists.first()?;
+        let (posargs_len, keywords_len) = (first.args.len(), first.keywords.len());
+        // Determine the idx of the value we will try next if needed.
+        self.idx = match idx {
+            Either::Left(i) if i < posargs_len - 1 => Either::Left(i + 1),
+            Either::Left(_) => Either::Right(0),
+            Either::Right(i) if i < keywords_len => Either::Right(i + 1),
+            Either::Right(_) => return None,
         };
-        let expanded_types = self.expand_type(value.infer(self.solver, errors));
-        if expanded_types.is_empty() {
+        // Earlier correlated expansions specialize whole lists, so the same argument can have a
+        // different type in each list and must be expanded separately for each one.
+        let expansions = self
+            .arg_lists
+            .iter()
+            .map(|list| {
+                let value = match idx {
+                    Either::Left(i) => match &list.args[i] {
+                        CallArg::Arg(value) | CallArg::Star(value, ..) => value,
+                    },
+                    Either::Right(i) => &list.keywords[i].value,
+                };
+                let ty = value.infer(self.solver, errors);
+                match (call, ty.as_quantified_cases()) {
+                    (Some(_), Some((q, cases))) => Either::Right((q.clone(), cases.len())),
+                    _ => Either::Left(self.expand_type(ty).into_map(|t| owner.push(t))),
+                }
+            })
+            .collect::<Vec<_>>();
+        let width = |expansion: &Either<Vec<&'a Type>, (Quantified, usize)>| match expansion {
+            Either::Left(types) => types.len(),
+            Either::Right((_, n)) => *n,
+        };
+        if expansions.iter().all(|e| width(e) == 0) {
             // Nothing to expand here, try the next argument.
-            self.expand(errors, owner)
-        } else {
-            let expanded_types = expanded_types.into_map(|t| owner.push(t));
-            let mut new_arg_lists = Vec::new();
-            for (posargs, keywords) in self.arg_lists.iter() {
-                for ty in expanded_types.iter() {
-                    let mut new_posargs = posargs.clone();
-                    let mut new_keywords = keywords.clone();
-                    match idx {
-                        Either::Left(i) => {
-                            let new_value = TypeOrExpr::Type(ty, posargs[i].range());
-                            new_posargs[i] = match posargs[i] {
-                                CallArg::Arg(_) => CallArg::Arg(new_value),
-                                CallArg::Star(_, range) => CallArg::Star(new_value, range),
+            return self.expand_impl(errors, owner, call);
+        }
+        let mut new_arg_lists = Vec::new();
+        for (list, expansion) in self.arg_lists.iter().zip(&expansions) {
+            // A list whose argument does not expand is kept as a single choice, so that every
+            // list records a choice at every step.
+            for index in 0..max(width(expansion), 1) {
+                let mut choices = list.choices.clone();
+                let new_list = match expansion {
+                    Either::Left(types) => {
+                        choices.push(ExpansionChoice {
+                            quantified: None,
+                            index,
+                        });
+                        let mut new_list = ExpandedArgs {
+                            args: list.args.clone(),
+                            keywords: list.keywords.clone(),
+                            choices,
+                        };
+                        if let Some(ty) = types.get(index) {
+                            match idx {
+                                Either::Left(i) => {
+                                    let new_value = TypeOrExpr::Type(ty, list.args[i].range());
+                                    new_list.args[i] = match list.args[i] {
+                                        CallArg::Arg(_) => CallArg::Arg(new_value),
+                                        CallArg::Star(_, range) => CallArg::Star(new_value, range),
+                                    }
+                                }
+                                Either::Right(i) => {
+                                    new_list.keywords[i].value =
+                                        TypeOrExpr::Type(ty, list.keywords[i].range());
+                                }
                             }
                         }
-                        Either::Right(i) => {
-                            let new_value = TypeOrExpr::Type(ty, keywords[i].range());
-                            new_keywords[i] = CallKeyword {
-                                range: keywords[i].range(),
-                                arg: keywords[i].arg,
-                                value: new_value,
-                            }
+                        new_list
+                    }
+                    Either::Right((q, _)) => {
+                        let call = call.expect("correlated expansion requires `CallWithTypes`");
+                        choices.push(ExpansionChoice {
+                            quantified: Some(q.clone()),
+                            index,
+                        });
+                        ExpandedArgs {
+                            args: call.specialized_vec_call_arg(
+                                &list.args,
+                                q,
+                                index,
+                                self.solver,
+                                errors,
+                            ),
+                            keywords: call.specialized_vec_call_keyword(
+                                &list.keywords,
+                                q,
+                                index,
+                                self.solver,
+                                errors,
+                            ),
+                            choices,
                         }
                     }
-                    new_arg_lists.push((new_posargs, new_keywords));
-                    if self.gas.stop() {
-                        // We've hit our hard-coded limit; stop expanding, and move `idx` past the
-                        // end of the keywords so that subsequent `expand` calls know we're done.
-                        self.idx = Either::Right(keywords.len());
-                        return None;
-                    }
+                };
+                new_arg_lists.push(new_list);
+                if self.gas.stop() {
+                    // We've hit our hard-coded limit; stop expanding, and move `idx` past the
+                    // end of the keywords so that subsequent `expand` calls know we're done.
+                    self.idx = Either::Right(keywords_len);
+                    return None;
                 }
             }
-            self.arg_lists = new_arg_lists.clone();
-            Some(new_arg_lists)
         }
+        self.arg_lists = new_arg_lists.clone();
+        Some(new_arg_lists)
     }
 
     /// Expands a type according to https://typing.python.org/en/latest/spec/overload.html#argument-type-expansion.
@@ -299,6 +442,81 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .expect("a nonempty collection of results can always be combined")
     }
 
+    /// Reassembles the results of calls with expanded argument lists, where `results[i]` is the
+    /// result for `lists[i]` and every list shares the same first `depth` choices. Lists with the
+    /// same prefix made the same choice kind at each step, because they expanded the same type. Results that
+    /// differ in the choice of a union member are unioned. Results that differ in the constraint
+    /// chosen for a quantified become cases over that quantified, preserving which constraint
+    /// produced which result.
+    fn combine_expanded_results(
+        &self,
+        lists: &[ExpandedArgs],
+        mut results: Vec<Type>,
+        depth: usize,
+    ) -> Type {
+        let Some(choice) = lists[0].choices.get(depth) else {
+            assert_eq!(results.len(), 1, "lists with identical choices are unique");
+            return results.pop().expect("there is one result");
+        };
+        // Lists sharing a prefix of choices are contiguous, and their choices at `depth` are in
+        // ascending order, so each run of equal indices is one group.
+        let mut groups = Vec::new();
+        let mut results = results.into_iter();
+        for group in lists.chunk_by(|x, y| x.choices[depth].index == y.choices[depth].index) {
+            groups.push(self.combine_expanded_results(
+                group,
+                results.by_ref().take(group.len()).collect(),
+                depth + 1,
+            ));
+        }
+        match &choice.quantified {
+            Some(q) => Type::quantified_cases(q.clone(), groups),
+            None => self.unions(groups),
+        }
+    }
+
+    /// The quantified of the first live `QuantifiedCases` in the argument types, provided that
+    /// evaluating the call once per combination of the constraints of every such quantified stays
+    /// within the argument type expansion limit. Pending cases have no live quantified.
+    fn live_case_quantified(
+        &self,
+        args: &[CallArg],
+        keywords: &[CallKeyword],
+    ) -> Option<Quantified> {
+        let mut quantifieds: Vec<&Quantified> = Vec::new();
+        let values = args
+            .iter()
+            .map(|arg| match arg {
+                CallArg::Arg(value) | CallArg::Star(value, _) => value,
+            })
+            .chain(keywords.iter().map(|kw| &kw.value));
+        for value in values {
+            if let TypeOrExpr::Type(ty, _) = value {
+                let mut free = Vec::new();
+                ty.for_each_free_quantified(&mut |q| free.push(q));
+                ty.universe(&mut |t| {
+                    if let Type::QuantifiedCases(cases) = t
+                        && let Some(q) = cases.quantified()
+                        && free.contains(&q)
+                        && !quantifieds.contains(&q)
+                    {
+                        quantifieds.push(q);
+                    }
+                });
+            }
+        }
+        let combinations = quantifieds
+            .iter()
+            .try_fold(1usize, |n, q| match q.restriction() {
+                Restriction::Constraints(cs) => n.checked_mul(cs.len()),
+                _ => unreachable!("cases are indexed by a constrained type variable"),
+            })?;
+        if combinations > ArgsExpander::<Ans>::GAS {
+            return None;
+        }
+        quantifieds.first().map(|q| (*q).clone())
+    }
+
     /// Calls an overloaded function, returning the return type, the closest matching overload
     /// signature, and the solutions that signature settled on.
     pub fn call_overloads(
@@ -325,7 +543,69 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let args = call.vec_call_arg(args, self, errors);
         let keywords = call.vec_call_keyword(keywords, self, errors);
 
+        // An argument whose value depends on the constraint chosen for a live quantified is
+        // evaluated once per constraint, even if the unsplit call would match. Otherwise a generic
+        // overload would solve its type variables to the union of the cases, losing which
+        // constraint produced which result. Specializing removes the quantified, so each nested
+        // call splits on fewer quantifieds; the total number of calls is bounded up front.
+        // Constructors share mutable type arguments across __new__/__init__, so they use the
+        // ordinary inference path rather than committing different instantiations per case.
+        if ctor_targs.is_none()
+            && let Some(q) = self.live_case_quantified(&args, &keywords)
+        {
+            let Restriction::Constraints(constraints) = q.restriction() else {
+                unreachable!("cases are indexed by a constrained type variable")
+            };
+            let mut signature = None;
+            let case_errors = self.error_collector();
+            let results = (0..constraints.len())
+                .map(|index| {
+                    let case_call = CallWithTypes::new();
+                    let hint_ty = hint
+                        .map(|hint| hint.map_types(self, |ty| ty.specialize_quantified(&q, index)));
+                    let (ty, case_signature, _) = self.call_overloads(
+                        overloads.mapped_ref(|t| specialize_target(t.clone(), &q, index)),
+                        metadata,
+                        shape_transform,
+                        self_obj
+                            .as_ref()
+                            .map(|t| t.specialize_quantified(&q, index)),
+                        &case_call.specialized_vec_call_arg(&args, &q, index, self, &case_errors),
+                        &case_call.specialized_vec_call_keyword(
+                            &keywords,
+                            &q,
+                            index,
+                            self,
+                            &case_errors,
+                        ),
+                        arguments_range,
+                        &case_errors,
+                        return_errors,
+                        context,
+                        HintRef::with_ty_opt(hint, hint_ty.as_ref()),
+                        None,
+                    );
+                    signature.get_or_insert(case_signature);
+                    ty
+                })
+                .collect();
+            errors.extend_case_errors(case_errors, |_| {
+                format!("Call is invalid for some constraints of `{q}`")
+            });
+            return (
+                Type::quantified_cases(q, results),
+                signature.expect("a constrained type variable has constraints"),
+                // Constraint choices are universal, not alternative overload solutions. As for
+                // union callees, do not merge the individual calls' overload tables.
+                OverloadTable::default(),
+            );
+        }
+
         // Evaluate the call following https://typing.python.org/en/latest/spec/overload.html#overload-call-evaluation.
+
+        // Overloads specialized during argument type expansion, which must outlive the results
+        // that refer to them.
+        let specialized_targets = Owner::new();
 
         // Step 1: eliminate overloads that accept an incompatible number of arguments.
         let mut arity_closest_overload = None;
@@ -378,13 +658,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
                 // Step 3: argument type expansion. When the mypy-compatibility flag is on, we also
                 // use it to narrow an already-matched call to a more precise return type.
+                // Unlike the up-front split of dependent values, this is a fallback for a failed
+                // call, chiefly on plain constrained TypeVars and ordinary unions. Live cases
+                // only remain here when construction or the combination budget prevented the
+                // up-front split; the expander applies its own budget before evaluating calls.
                 let refine = matched
                     && self.solver().config.legacy_overload_expansion
                     && matches!(&closest_overload.res, Type::Union(_));
                 let mut args_expander = ArgsExpander::new(args.clone(), keywords.clone(), self);
                 let owner = Owner::new();
+                let expansion_call = CallWithTypes::new();
                 'outer: while (!matched || refine)
-                    && let Some(arg_lists) = args_expander.expand(errors, &owner)
+                    && let Some(arg_lists) =
+                        args_expander.expand_correlated(errors, &owner, &expansion_call)
                 {
                     // Expand by one argument (for example, try splitting up union types), and try the call with each
                     // resulting arguments list.
@@ -392,14 +678,33 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     // - If any do not match, we move on to the next splittable argument (if we run out of args to split,
                     //   we'll wind up with a failed match and our best guess at the correct overload)
                     let mut matched_overloads = Vec::new();
-                    for (cur_args, cur_keywords) in arg_lists.clone().iter() {
-                        let (cur_closest, cur_matched) = self.find_closest_overload(
-                            &arity_compatible_overloads,
+                    for list in arg_lists.iter() {
+                        let hint_ty = hint
+                            .filter(|_| list.has_quantified_choices())
+                            .map(|hint| hint.map_types(self, |ty| list.specialize(ty.clone())));
+                        let hint = match &hint_ty {
+                            Some(ty) => HintRef::with_ty_opt(hint, Some(ty)),
+                            None => hint,
+                        };
+                        // Free occurrences of a split quantified in the signatures and the
+                        // receiver must agree with the constraint chosen for the arguments.
+                        let specialized = list.has_quantified_choices().then(|| {
+                            specialized_targets.push(
+                                arity_compatible_overloads
+                                    .mapped_ref(|t| list.specialize_target(t)),
+                            )
+                        });
+                        let specialized_refs = specialized.as_ref().map(|ts| ts.mapped_ref(|t| t));
+                        let cur_self_obj = self_obj.clone().map(|t| list.specialize(t));
+                        let (mut cur_closest, cur_matched) = self.find_closest_overload(
+                            specialized_refs
+                                .as_ref()
+                                .unwrap_or(&arity_compatible_overloads),
                             metadata,
                             shape_transform,
-                            self_obj.as_ref(),
-                            cur_args,
-                            cur_keywords,
+                            cur_self_obj.as_ref(),
+                            &list.args,
+                            &list.keywords,
                             arguments_range,
                             errors,
                             hint,
@@ -407,6 +712,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         );
                         if !cur_matched {
                             continue 'outer;
+                        }
+                        if let Some(specialized) = specialized {
+                            let index = specialized
+                                .iter()
+                                .position(|t| ptr_eq(t, cur_closest.func))
+                                .expect("the closest overload is one of the specialized overloads");
+                            cur_closest.func = arity_compatible_overloads[index];
                         }
                         matched_overloads.push(cur_closest);
                     }
@@ -448,10 +760,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ctor_targs,
                             table,
                             argmap,
-                            res: self.unions(matched_overloads.into_map(|o| {
-                                arg_errors.extend(o.arg_errors);
-                                o.res
-                            })),
+                            res: self.combine_expanded_results(
+                                &arg_lists,
+                                matched_overloads.into_map(|o| {
+                                    arg_errors.extend(o.arg_errors);
+                                    o.res
+                                }),
+                                0,
+                            ),
                             arg_errors,
                             call_errors: self.error_collector(),
                             specialization_errors,

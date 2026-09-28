@@ -136,6 +136,26 @@ def f[L: (A, B), R: (C, D)](p: P[L, R]) -> None:
     "#,
 );
 
+// Generic overloads such as `iter` and `next` are evaluated once per constraint when an argument
+// depends on the constraint, so the result keeps its cases.
+testcase!(
+    test_constrained_next_iter,
+    r#"
+from typing import Self, assert_type
+class DataFrame:
+    def groups(self) -> list[tuple[str, Self]]: ...
+class Series:
+    def groups(self) -> list[tuple[str, Self]]: ...
+def f[T: (DataFrame, Series)](x: T) -> T:
+    assert_type(next(iter(x.groups())), tuple[str, T])
+    _, first = next(iter(x.groups()))
+    return first
+def wrong[T: (DataFrame, Series)](x: T) -> DataFrame:
+    _, first = next(iter(x.groups()))
+    return first  # E: not assignable to declared return type `DataFrame`
+    "#,
+);
+
 testcase!(
     test_constrained_different_length_cases,
     r#"
