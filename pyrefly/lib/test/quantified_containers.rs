@@ -11,6 +11,22 @@
 use crate::testcase;
 
 testcase!(
+    test_constrained_tuple_result_unpacking,
+    r#"
+from typing import Self, assert_type
+class DataArray:
+    def align(self, other: Self) -> tuple[Self, Self]: ...
+class Dataset:
+    def align(self, other: Self) -> tuple[Self, Self]: ...
+def f[T: (DataArray, Dataset)](a: T, b: T) -> tuple[T, T]:
+    x, y = a.align(b)
+    assert_type(x, T)
+    assert_type(y, T)
+    return a.align(b)
+    "#,
+);
+
+testcase!(
     test_constrained_heterogeneous_tuple_result_unpacking,
     r#"
 from typing import Self, assert_type
@@ -147,6 +163,25 @@ class B:
 def f[T: (A, B)](x: T):
     a, b = x.parts()
     a, b, c = x.parts()  # E: Cannot unpack
+    "#,
+);
+
+testcase!(
+    test_constrained_tuple_indexing,
+    r#"
+from typing import Self, assert_type
+class DataArray:
+    def align(self, other: Self) -> tuple[Self, Self]: ...
+    def split(self) -> tuple[int, Self]: ...
+class Dataset:
+    def align(self, other: Self) -> tuple[Self, Self]: ...
+    def split(self) -> tuple[int, Self]: ...
+def f[T: (DataArray, Dataset)](a: T, b: T) -> T:
+    pair = a.align(b)
+    assert_type(pair[0], T)
+    assert_type(pair[-1], T)
+    assert_type(a.split()[0], int)
+    return pair[1]
     "#,
 );
 

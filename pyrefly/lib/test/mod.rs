@@ -72,6 +72,7 @@ mod pydantic;
 mod pysa;
 pub(crate) mod python_env;
 mod pytorch_efficiency_lint;
+mod quantified_callbacks;
 mod quantified_containers;
 mod quantified_diagnostics;
 mod quantified_helpers;

@@ -1772,6 +1772,23 @@ def bad() -> None:
  "#,
 );
 
+// Minimal stand-ins for the Polars patterns in
+// https://github.com/facebook/pyrefly/issues/3621 and
+// https://github.com/facebook/pyrefly/issues/3892.
+testcase!(
+    test_constrained_method_arg_same_typevar,
+    r#"
+from typing import assert_type
+class DataFrame:
+    def join(self, other: DataFrame) -> DataFrame: ...
+class LazyFrame:
+    def join(self, other: LazyFrame) -> LazyFrame: ...
+def f[Frame: (DataFrame, LazyFrame)](left: Frame, right: Frame) -> Frame:
+    assert_type(left.join(right), Frame)
+    return left.join(right)
+    "#,
+);
+
 testcase!(
     test_constrained_method_intermediate_result,
     r#"
@@ -1794,6 +1811,53 @@ def chained[Frame: (DataFrame, LazyFrame)](df: Frame) -> Frame:
 );
 
 testcase!(
+    test_constrained_stored_bound_method,
+    r#"
+from typing import assert_type
+class DataFrame:
+    def join(self, other: DataFrame) -> DataFrame: ...
+class LazyFrame:
+    def join(self, other: LazyFrame) -> LazyFrame: ...
+def f[Frame: (DataFrame, LazyFrame)](left: Frame, right: Frame) -> Frame:
+    join = left.join
+    assert_type(join(right), Frame)
+    return join(right)
+    "#,
+);
+
+testcase!(
+    test_constrained_method_arg_negatives,
+    r#"
+class DataFrame:
+    def join(self, other: DataFrame) -> DataFrame: ...
+class LazyFrame:
+    def join(self, other: LazyFrame) -> LazyFrame: ...
+def union_args(left: DataFrame | LazyFrame, right: DataFrame | LazyFrame):
+    left.join(right)  # E: type `DataFrame` # E: type `LazyFrame`
+def concrete_arg[Frame: (DataFrame, LazyFrame)](left: Frame):
+    left.join(DataFrame())  # E: not assignable
+    left.join(*[])  # E: Missing argument
+    left.join(*[left, left])  # E: positional argument
+def union_return[Frame: (DataFrame, LazyFrame)](df: Frame, other: DataFrame | LazyFrame) -> Frame:
+    return other  # E: not assignable
+    "#,
+);
+
+testcase!(
+    test_constrained_method_arg_independent_typevars,
+    r#"
+class DataFrame:
+    def join(self, other: DataFrame) -> DataFrame: ...
+class LazyFrame:
+    def join(self, other: LazyFrame) -> LazyFrame: ...
+def f[F1: (DataFrame, LazyFrame), F2: (DataFrame, LazyFrame)](left: F1, right: F2):
+    left.join(right)  # E: Call is invalid for some constraints
+def g[F1: (DataFrame, LazyFrame), F2: (DataFrame, LazyFrame)](left: F1, right: F1) -> F2:
+    return left.join(right)  # E: not assignable
+    "#,
+);
+
+testcase!(
     test_constrained_method_self_return,
     r#"
 from typing import Self, assert_type
@@ -1804,6 +1868,69 @@ class LazyFrame:
 def f[Frame: (DataFrame, LazyFrame)](df: Frame) -> Frame:
     assert_type(df.copy(), Frame)
     return df.copy()
+    "#,
+);
+
+testcase!(
+    test_constrained_method_contextual_args,
+    r#"
+from typing import Callable, assert_type
+class DataFrame:
+    def pipe(self, f: Callable[[int], int]) -> DataFrame: ...
+    def make(self, f: Callable[[int], DataFrame]) -> DataFrame: ...
+    def concat(self, others: list[DataFrame]) -> DataFrame: ...
+class LazyFrame:
+    def pipe(self, f: Callable[[int], int]) -> LazyFrame: ...
+    def make(self, f: Callable[[int], LazyFrame]) -> LazyFrame: ...
+    def concat(self, others: list[LazyFrame]) -> LazyFrame: ...
+def f[Frame: (DataFrame, LazyFrame)](left: Frame, right: Frame) -> Frame:
+    assert_type(left.pipe(lambda x: x + 1), Frame)
+    assert_type(left.make(lambda x: right), Frame)
+    assert_type(left.concat([right]), Frame)
+    left.make(lambda x: DataFrame())  # E: not assignable
+    left.pipe(lambda x: "wrong")  # E: Call is invalid for some constraints
+    return left.concat([])
+    "#,
+);
+
+testcase!(
+    test_constrained_intermediate_attributes_and_calls,
+    r#"
+from typing import assert_type
+class DataFrame:
+    def group_by(self) -> DataFrameGroup: ...
+    def join(self, other: DataFrame) -> DataFrame: ...
+    def count(self) -> int: ...
+class LazyFrame:
+    def group_by(self) -> LazyFrameGroup: ...
+    def join(self, other: LazyFrame) -> LazyFrame: ...
+    def count(self) -> int: ...
+class DataFrameGroup:
+    source: DataFrame
+    @property
+    def first(self) -> DataFrame: ...
+    def frames(self) -> list[DataFrame]: ...
+class LazyFrameGroup:
+    source: LazyFrame
+    @property
+    def first(self) -> LazyFrame: ...
+    def frames(self) -> list[LazyFrame]: ...
+def ident[X](x: X) -> X:
+    return x
+def f[Frame: (DataFrame, LazyFrame)](df: Frame, other: Frame) -> Frame:
+    grouped = df.group_by()
+    assert_type(grouped.source, Frame)
+    assert_type(grouped.first, Frame)
+    assert_type(ident(grouped).first, Frame)
+    assert_type(df.count(), int)
+    frames = grouped.frames()
+    frames.append(other)
+    frames.append(DataFrame())  # E: not assignable
+    assert_type(df.join(other=other), Frame)
+    assert_type(df.join(*(other,)), Frame)
+    assert_type(df.join(*[other]), Frame)
+    assert_type(df.join(**{"other": other}), Frame)
+    return frames[0]
     "#,
 );
 

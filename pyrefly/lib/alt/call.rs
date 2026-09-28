@@ -209,6 +209,52 @@ impl TargetWithTParams<Callable> {
 }
 
 impl CallTarget {
+    /// Visit the types that this target is made of, which contain every solver variable that
+    /// calling it reads.
+    fn visit_types<'a>(&'a self, f: &mut impl FnMut(&'a Type)) {
+        match self {
+            Self::Callable(TargetWithTParams(tparams, callable)) => {
+                tparams.visit(f);
+                callable.visit(f);
+            }
+            Self::Function(TargetWithTParams(tparams, func)) => {
+                tparams.visit(f);
+                func.visit(f);
+            }
+            Self::BoundMethod(obj, TargetWithTParams(tparams, func)) => {
+                f(obj);
+                tparams.visit(f);
+                func.visit(f);
+            }
+            Self::Class(cls, _, quantified) => {
+                cls.visit(f);
+                quantified.visit(f);
+            }
+            Self::TypedDict(typed_dict) => typed_dict.visit(f),
+            Self::FunctionOverload(funcs, metadata) => {
+                for TargetWithTParams(tparams, func) in funcs {
+                    tparams.visit(f);
+                    func.visit(f);
+                }
+                metadata.visit(f);
+            }
+            Self::BoundMethodOverload(obj, funcs, metadata) => {
+                f(obj);
+                for TargetWithTParams(tparams, func) in funcs {
+                    tparams.visit(f);
+                    func.visit(f);
+                }
+                metadata.visit(f);
+            }
+            Self::Union(targets) => targets.iter().for_each(|target| target.visit_types(f)),
+            Self::QuantifiedCases(quantified, targets) => {
+                quantified.visit(f);
+                targets.iter().for_each(|target| target.visit_types(f));
+            }
+            Self::Any(_) => {}
+        }
+    }
+
     fn function_metadata(&self) -> Option<&FuncMetadata> {
         match self {
             Self::Function(func) | Self::BoundMethod(_, func) => Some(&func.1.metadata),
@@ -2027,31 +2073,64 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 CallOutcome { ty, overload_table }
             }
             CallTarget::QuantifiedCases(quantified, targets) => {
+                let call_case = |index: usize,
+                                 args: &[CallArg],
+                                 keywords: &[CallKeyword],
+                                 errors: &ErrorCollector,
+                                 return_errors: &ErrorCollector| {
+                    let specialized = CallWithTypes::new();
+                    let args = specialized.specialized_vec_call_arg(
+                        args,
+                        &quantified,
+                        index,
+                        self,
+                        errors,
+                    );
+                    let keywords = specialized.specialized_vec_call_keyword(
+                        keywords,
+                        &quantified,
+                        index,
+                        self,
+                        errors,
+                    );
+                    let hint_ty = hint.map(|hint| {
+                        hint.map_types(self, |ty| ty.specialize_quantified(&quantified, index))
+                    });
+                    self.call_infer_with_callee_range(
+                        targets[index].clone(),
+                        &args,
+                        &keywords,
+                        arguments_range,
+                        callee_range,
+                        errors,
+                        return_errors,
+                        context,
+                        HintRef::with_ty_opt(hint, hint_ty.as_ref()),
+                        None,
+                    )
+                    .ty
+                };
                 let call = CallWithTypes::new();
-                let args = call.vec_call_arg(args, self, errors);
-                let keywords = call.vec_call_keyword(keywords, self, errors);
+                let mut args = call.vec_call_arg(args, self, errors);
+                let mut keywords = call.vec_call_keyword(keywords, self, errors);
+                let mut types = hint.map_or_else(Vec::new, |hint| hint.types().iter().collect());
+                for target in &targets {
+                    target.visit_types(&mut |ty| types.push(ty));
+                }
+                call.infer_case_lambdas(
+                    &mut args,
+                    &mut keywords,
+                    targets.len(),
+                    &types,
+                    self,
+                    errors,
+                    |index, args, keywords, errors| {
+                        call_case(index, args, keywords, errors, errors);
+                    },
+                );
                 let case_errors = self.error_collector();
-                let results = targets
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, target)| {
-                        let hint_ty = hint.map(|hint| {
-                            hint.map_types(self, |ty| ty.specialize_quantified(&quantified, index))
-                        });
-                        self.call_infer_with_callee_range(
-                            target,
-                            &args,
-                            &keywords,
-                            arguments_range,
-                            callee_range,
-                            &case_errors,
-                            return_errors,
-                            context,
-                            HintRef::with_ty_opt(hint, hint_ty.as_ref()),
-                            None,
-                        )
-                        .ty
-                    })
+                let results = (0..targets.len())
+                    .map(|index| call_case(index, &args, &keywords, &case_errors, return_errors))
                     .collect();
                 errors.extend_case_errors(case_errors, |_| {
                     format!("Call is invalid for some constraints of `{quantified}`")
