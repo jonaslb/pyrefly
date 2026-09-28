@@ -13,6 +13,7 @@ use std::slice;
 use dupe::Dupe;
 use itertools::Either;
 use itertools::Itertools;
+use pyrefly_graph::index::Idx;
 use pyrefly_python::ast::Ast;
 use pyrefly_python::dunder;
 use pyrefly_python::module_name::ModuleName;
@@ -38,6 +39,7 @@ use pyrefly_types::shaped_array::ShapedArrayType;
 use pyrefly_types::shaped_array::shape_to_tuple_carrier;
 use pyrefly_types::shaped_array::tuple_carrier_to_shape;
 use pyrefly_types::shaped_array::type_to_dim;
+use pyrefly_types::simplify::intersect;
 use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_types::type_level_dsl::TypeShapeDslDomain;
 use pyrefly_types::typed_dict::AnonymousTypedDictInner;
@@ -458,6 +460,44 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             None => ExprOptions::infer(errors, None),
         };
         self.expr_with_options(x, options).into_ty()
+    }
+
+    /// Check against a branch-local constraint while preserving the declared type variable.
+    pub fn expr_check_with_narrowed_typevar(
+        &self,
+        x: &Expr,
+        check: Option<(&Type, &dyn Fn() -> TypeCheckContext)>,
+        narrowed_locals: &[Idx<Key>],
+        type_form_context: Option<TypeFormContext<'_>>,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let options = match check {
+            Some((want, context)) => ExprOptions::check(want, errors, errors, context, None),
+            None => ExprOptions::infer(errors, None),
+        }
+        .with_type_form_context(type_form_context);
+        if let Some((want, context)) = check
+            && let Some(narrowed) = self.narrow_constrained_typevar(want, narrowed_locals)
+        {
+            let got = self
+                .expr_with_options(
+                    x,
+                    ExprOptions::infer(errors, Some(HintRef::new(&narrowed, Some(errors))))
+                        .with_type_form_context(type_form_context),
+                )
+                .into_ty();
+            if self.is_subset_eq(&got, want) {
+                got
+            } else {
+                let got = self.check_and_return_type(got, &narrowed, x.range(), errors, context);
+                // The value must remain assignable to the original annotation after a flow merge.
+                self.distribute_over_union(&got, |got| {
+                    intersect(vec![want.clone(), got.clone()], got.clone(), self.heap)
+                })
+            }
+        } else {
+            self.expr_with_options(x, options).into_ty()
+        }
     }
 
     /// Infer a type for an expression. Convenience wrapper around `expr_with_options`.

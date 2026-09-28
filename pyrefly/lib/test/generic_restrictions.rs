@@ -1638,15 +1638,15 @@ def g[T: (int, str)](x: T) -> T:
     "#,
 );
 
+// Regression test for https://github.com/facebook/pyrefly/issues/3783.
 testcase!(
-    bug = "Return type T is narrowed to int, so returning 0 should be allowed",
     test_return_concrete_type_after_typevar_narrow,
     r#"
 def f[T: (int, str)](x: T) -> T:
     if isinstance(x, int):
-        return 0  # E: `Literal[0]` is not assignable to declared return type `T`
+        return 0
     else:
-        return x
+        return ""
     "#,
 );
 
@@ -1770,4 +1770,21 @@ class Nested[T: list[str]]:
 def bad() -> None:
     x: Nested[list[Any]] = Nested([1])  # Should be an error
  "#,
+);
+
+testcase!(
+    test_constrained_method_overlapping_constraints,
+    r#"
+class A:
+    def get(self) -> A: ...
+class B(A):
+    def get(self) -> B: ...
+def f[T: (A, B)](x: T) -> T:
+    return x.get()
+def g[T: (A, B)](x: T) -> T:
+    if isinstance(x, A):
+        # `T` may still be `B` here.
+        return A()  # E: not assignable
+    return x
+    "#,
 );

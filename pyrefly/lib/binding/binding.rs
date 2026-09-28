@@ -2113,6 +2113,8 @@ pub struct ReturnExplicit {
     pub is_async: bool,
     pub range: TextRange,
     pub is_unreachable: bool,
+    /// Local narrowing evidence available at the return statement.
+    pub narrowed_locals: Box<[Idx<Key>]>,
 }
 
 #[derive(Clone, Debug)]
@@ -2307,6 +2309,8 @@ pub struct NameAssign {
     pub attrs_field_specifier: Option<AttrsSpecifier>,
     /// If this name was redefined or narrowed prior to this assignment, the previous definition or narrow.
     pub last_value_or_narrow: Option<Idx<Key>>,
+    /// Local narrowing evidence available before this assignment rebinds its target.
+    pub narrowed_locals: Box<[Idx<Key>]>,
 }
 
 impl NameAssign {
@@ -2535,7 +2539,7 @@ pub enum Binding {
     ParamSpec(Box<(Option<Idx<KeyAnnotation>>, Identifier, Box<ExprCall>)>),
     TypeVarTuple(Box<(Option<Idx<KeyAnnotation>>, Identifier, Box<ExprCall>)>),
     /// An expression returned from a function.
-    ReturnExplicit(ReturnExplicit),
+    ReturnExplicit(Box<ReturnExplicit>),
     /// The implicit return from a function.
     ReturnImplicit(ReturnImplicit),
     /// The return type of a function.

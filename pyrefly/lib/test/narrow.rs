@@ -4060,6 +4060,18 @@ def test3(x: V) -> V:
 "#,
 );
 
+// Regression test for https://github.com/facebook/pyrefly/issues/3783.
+testcase!(
+    test_constrained_typevar_narrow_assignment,
+    r#"
+def f[T: (int, str)](x: T) -> T:
+    y: T = x
+    if isinstance(x, str):
+        y = ""
+    return y
+"#,
+);
+
 // Regression test for https://github.com/facebook/pyrefly/issues/2607
 testcase!(
     test_narrow_sequence_to_tuple_return,

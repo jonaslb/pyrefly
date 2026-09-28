@@ -743,6 +743,11 @@ impl<'a> BindingsBuilder<'a> {
         };
         // Must check before bind_name updates the flow.
         let last_value_or_narrow = self.scopes.last_value_or_narrow_for(&name.id);
+        let narrowed_locals = if self.scopes.current_annotation(&name.id).is_some() {
+            self.scopes.narrowed_locals()
+        } else {
+            Box::default()
+        };
         let canonical_ann = self.bind_name(&name.id, scope_idx, style);
         let ann = match direct_ann {
             Some((_, idx)) => Some((AnnotationStyle::Direct, idx)),
@@ -794,6 +799,7 @@ impl<'a> BindingsBuilder<'a> {
                 receiver_idx,
                 attrs_field_specifier,
                 last_value_or_narrow,
+                narrowed_locals,
             }))
         };
         self.insert_binding_idx(def_idx, binding);

@@ -121,6 +121,38 @@ enum IntersectFallback {
 }
 
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
+    /// Resolve a constrained type variable when local narrowing rules out every other constraint.
+    pub fn narrow_constrained_typevar(&self, ty: &Type, locals: &[Idx<Key>]) -> Option<Type> {
+        let Type::Quantified(q) = ty else {
+            return None;
+        };
+        let Restriction::Constraints(constraints) = q.restriction() else {
+            return None;
+        };
+        for idx in locals {
+            let local = self.get_idx(*idx);
+            let Some((local_q, Some(narrowed))) = local.ty().as_quantified() else {
+                continue;
+            };
+            if local_q != q.as_ref() {
+                continue;
+            }
+            // Keep overlapping constraints: an instance of a subclass does not identify
+            // which of its base classes was chosen as the type argument.
+            let mut possible = constraints.iter().filter(|constraint| {
+                !self
+                    .intersect_with_fallback(constraint, narrowed, IntersectFallback::Right)
+                    .is_never()
+            });
+            if let Some(constraint) = possible.next()
+                && possible.next().is_none()
+            {
+                return Some(constraint.clone());
+            }
+        }
+        None
+    }
+
     // Get the union of all members of an enum, minus the specified member
     fn subtract_enum_member(&self, instance: Instance, name: &Name) -> Type {
         if self

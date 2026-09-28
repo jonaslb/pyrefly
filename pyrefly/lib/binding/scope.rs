@@ -1143,7 +1143,7 @@ fn is_test_setup_method(method_name: &Name) -> bool {
 /// The boolean flag is set when we know for sure the statement is definitely unreachable.
 #[derive(Default, Clone, Debug)]
 pub struct YieldsAndReturns {
-    pub returns: Vec<(Idx<Key>, StmtReturn, bool)>,
+    pub returns: Vec<(Idx<Key>, StmtReturn, bool, Box<[Idx<Key>]>)>,
     pub yields: Vec<(Idx<KeyYield>, ExprYield, bool)>,
     pub yield_froms: Vec<(Idx<KeyYieldFrom>, ExprYieldFrom, bool)>,
     /// Whether this function syntactically contains `yield` or `yield from`.
@@ -1625,6 +1625,21 @@ impl Scopes {
 
     pub fn clone_current_flow(&self) -> Flow {
         self.current().flow.clone()
+    }
+
+    /// Capture current narrowing bindings before the flow advances or is merged.
+    pub fn narrowed_locals(&self) -> Box<[Idx<Key>]> {
+        self.current()
+            .flow
+            .info
+            .values()
+            .filter_map(|info| info.narrow.as_ref().map(|narrow| narrow.idx))
+            .collect()
+    }
+
+    /// Return a name's declared annotation without changing its flow binding.
+    pub fn current_annotation(&self, name: &Name) -> Option<Idx<KeyAnnotation>> {
+        self.current().stat.0.get(name)?.annotation()
     }
 
     /// Returns names that are implicit captures in the current scope:
@@ -3023,11 +3038,15 @@ impl Scopes {
         x: StmtReturn,
         is_unreachable: bool,
     ) -> Result<(), (CurrentIdx, StmtReturn)> {
+        let narrowed_locals = self.narrowed_locals();
         match self.current_yields_and_returns_mut() {
             Some(yields_and_returns) => {
-                yields_and_returns
-                    .returns
-                    .push((ret.into_idx(), x, is_unreachable));
+                yields_and_returns.returns.push((
+                    ret.into_idx(),
+                    x,
+                    is_unreachable,
+                    narrowed_locals,
+                ));
                 Ok(())
             }
             None => Err((ret, x)),

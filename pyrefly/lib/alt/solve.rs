@@ -3079,6 +3079,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     expr,
                     None,
                     None,
+                    &[],
                     Some(TypeFormContext::TypeAlias),
                     errors,
                 );
@@ -4006,6 +4007,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         expr: &Expr,
         attrs_field_specifier: Option<AttrsSpecifier>,
         last_value_or_narrow: Option<Idx<Key>>,
+        narrowed_locals: &[Idx<Key>],
         type_form_context: Option<TypeFormContext<'_>>,
         errors: &ErrorCollector,
     ) -> (Option<&AnnotationWithTarget>, Type) {
@@ -4091,14 +4093,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     got
                 } else {
                     let hint = annot_ty.as_ref().map(|t| (t, tcc));
-                    let options = match hint {
-                        Some((want, context)) => {
-                            ExprOptions::check(want, errors, errors, context, None)
-                        }
-                        None => ExprOptions::infer(errors, None),
-                    };
-                    self.expr_with_options(expr, options.with_type_form_context(type_form_context))
-                        .into_ty()
+                    self.expr_check_with_narrowed_typevar(
+                        expr,
+                        hint,
+                        narrowed_locals,
+                        type_form_context,
+                        errors,
+                    )
                 };
                 let ty = match style {
                     AnnotationStyle::Direct => {
@@ -4172,6 +4173,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         is_class_body_assignment: bool,
         attrs_field_specifier: Option<AttrsSpecifier>,
         last_value_or_narrow: Option<Idx<Key>>,
+        narrowed_locals: &[Idx<Key>],
         errors: &ErrorCollector,
     ) -> Type {
         let (annot, ty) = self.name_assign_infer(
@@ -4181,6 +4183,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             expr,
             attrs_field_specifier,
             last_value_or_narrow,
+            narrowed_locals,
             None,
             errors,
         );
@@ -4443,7 +4446,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     .with_annotation(annot_range, "declared return type".to_owned())
             };
             if let Some(expr) = &x.expr {
-                let return_ty = self.expr_check(expr, hint.as_ref().map(|t| (t, tcc)), errors);
+                let return_ty = self.expr_check_with_narrowed_typevar(
+                    expr,
+                    hint.as_ref().map(|t| (t, tcc)),
+                    &x.narrowed_locals,
+                    None,
+                    errors,
+                );
                 self.check_any_return(hint.as_ref(), &return_ty, expr.range(), errors);
                 return_ty
             } else if let Some(hint) = hint {
@@ -6590,6 +6599,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 x.is_class_body_assignment,
                 x.attrs_field_specifier,
                 x.last_value_or_narrow,
+                &x.narrowed_locals,
                 errors,
             ),
             Binding::TypeVar(x) => {
