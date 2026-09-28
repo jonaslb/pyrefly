@@ -2699,6 +2699,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     self.as_attribute_base1(ty, acc)
                 }
             }
+            Type::QuantifiedCases(cases) => {
+                // Attribute-base consumers without case-aware result handling
+                // conservatively require the operation on every alternative.
+                for ty in cases.cases().iter().cloned() {
+                    self.as_attribute_base1(ty, acc);
+                }
+            }
             Type::Quantified(quantified) => match quantified.restriction() {
                 Restriction::Bound(ty) => {
                     let mut use_fallback = false;

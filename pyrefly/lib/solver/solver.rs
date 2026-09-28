@@ -27,6 +27,7 @@ use pyrefly_types::heap::TypeHeap;
 use pyrefly_types::literal::LitStyle;
 use pyrefly_types::quantified::Quantified;
 use pyrefly_types::quantified::QuantifiedKind;
+use pyrefly_types::quantified_cases::QuantifiedCases;
 use pyrefly_types::shaped_array::IntTuple;
 use pyrefly_types::simplify::intersect;
 use pyrefly_types::special_form::SpecialForm;
@@ -1229,6 +1230,11 @@ impl Solver {
     /// Simplify a type as much as we can.
     fn simplify_mut(&self, t: &mut Type) {
         t.transform_mut(&mut |x| {
+            if let Type::QuantifiedCases(cases) = x
+                && let Some(resolved) = cases.resolve_selector()
+            {
+                *x = resolved;
+            }
             if let Type::Union(u) = x {
                 let mut merged = unions(mem::take(&mut u.members), &self.heap);
                 // Preserve union display names during simplification
@@ -1732,6 +1738,25 @@ impl Solver {
             bounds.retain(|t| !t.is_any());
         }
         Some(unions(bounds, &self.heap))
+    }
+
+    /// The join of a variable's current non-`Any`, non-`Never` lower bounds, without recording
+    /// an answer or consuming the bounds. Lower bounds only grow, so the result can only move up.
+    pub(crate) fn peek_lower_bound(&self, v: Var) -> Option<Type> {
+        let lock = self.variables.lock();
+        let variable = lock.get(v);
+        let Variable::Quantified { bounds, .. } = &*variable else {
+            return None;
+        };
+        let lower: Vec<Type> = bounds
+            .lower
+            .iter()
+            .filter(|t| !t.is_any() && !t.is_never() && !t.is_placeholder())
+            .cloned()
+            .collect();
+        drop(variable);
+        drop(lock);
+        self.solve_one_bounds(lower)
     }
 
     fn solve_bounds(&self, mut bounds: Bounds) -> Option<Type> {
@@ -3569,6 +3594,42 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
             }
         }
         Some(best)
+    }
+
+    /// Chooses the case of a `QuantifiedCases` whose choice is pending on a solver variable, when
+    /// the variable's answer or current lower bounds already determine it. Upper bounds alone are
+    /// provisional and never select a case. A choice made from lower bounds is recorded as an
+    /// upper bound on the variable: lower bounds only grow, so any later lower bound that would
+    /// promote to a different constraint then fails against that upper bound. No answer is forced.
+    /// Like other subset checks, this commits bounds on success. Speculative union and overload
+    /// checks own the surrounding snapshot; their variable traversal includes pending selectors.
+    pub(crate) fn select_pending_case(&mut self, cases: &QuantifiedCases) -> Option<Type> {
+        let Some(Type::Var(v)) = cases.selector() else {
+            return None;
+        };
+        let v = *v;
+        let expanded = self.solver.expand(Type::Var(v));
+        if !matches!(expanded, Type::Var(_)) {
+            return Some(cases.select(expanded));
+        }
+        let current = self.solver.peek_lower_bound(v)?;
+        if !current.collect_all_vars().is_empty() {
+            return None;
+        }
+        let constraint = self
+            .find_matching_constraint(&current, cases.constraints())?
+            .clone();
+        let [index] = cases
+            .constraints()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| (c == &constraint).then_some(i))
+            .collect::<Vec<_>>()[..]
+        else {
+            return None;
+        };
+        self.is_subset_eq(&Type::Var(v), &constraint).ok()?;
+        Some(cases.cases()[index].clone())
     }
 
     /// Check `got` against the restriction of the type parameter that `v`'s answer instantiates,

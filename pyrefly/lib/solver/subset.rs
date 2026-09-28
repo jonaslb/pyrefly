@@ -2033,6 +2033,28 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                     &want,
                 )
             }
+            // A `QuantifiedCases` value is known only up to which constraint its quantified
+            // variable was solved to, so every case must hold. Specializing the other side under
+            // the same `Quantified` identity aligns cases that share that identity. A pending
+            // value has no live quantified, so its cases are checked independently.
+            (Type::QuantifiedCases(cases), u) => match cases.quantified() {
+                Some(q) => all(cases.cases().iter().enumerate(), |(i, l)| {
+                    self.is_subset_eq(l, &u.specialize_quantified(q, i))
+                }),
+                None => match self.select_pending_case(cases) {
+                    Some(l) => self.is_subset_eq(&l, u),
+                    None => all(cases.cases().iter(), |l| self.is_subset_eq(l, u)),
+                },
+            },
+            (l, Type::QuantifiedCases(cases)) => match cases.quantified() {
+                Some(q) => all(cases.cases().iter().enumerate(), |(i, u)| {
+                    self.is_subset_eq(&l.specialize_quantified(q, i), u)
+                }),
+                None => match self.select_pending_case(cases) {
+                    Some(u) => self.is_subset_eq(l, &u),
+                    None => all(cases.cases().iter(), |u| self.is_subset_eq(l, u)),
+                },
+            },
             (Type::Overloaded(branches), u) => self.is_subset_overloaded(branches, u),
             (Type::Intersect(l), u) => any(l.0.iter(), |l| self.is_subset_eq(l, u)),
             (Type::Union(l_union), u) => all(l_union.members.iter(), |l| self.is_subset_eq(l, u)),

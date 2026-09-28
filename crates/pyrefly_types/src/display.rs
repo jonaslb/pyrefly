@@ -1467,6 +1467,7 @@ impl<'a> TypeDisplayContext<'a> {
                     self.fmt_type_sequence(union_members, " | ", true, output)
                 }
             }
+            Type::QuantifiedCases(cases) => self.fmt_helper_generic(&cases.erase(), false, output),
             Type::Intersect(x) => self.fmt_type_sequence(x.0.iter(), " & ", true, output),
             Type::Tuple(t) => {
                 if self.always_display_builtins_module_name {

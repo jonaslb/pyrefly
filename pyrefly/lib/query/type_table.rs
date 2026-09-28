@@ -333,6 +333,7 @@ pub(super) fn type_to_indexed_shape(
             type_to_indexed_shape(context, &body_type, table)
         }
         Type::Union(union) => union_to_indexed_shape(context, union, table),
+        Type::QuantifiedCases(cases) => type_to_indexed_shape(context, &cases.erase(), table),
         Type::Intersect(intersection) => {
             let (members, _fallback) = &**intersection;
             let args = members

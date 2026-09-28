@@ -266,6 +266,7 @@ impl TypeConverter<'_> {
             // --- Callable (typing.Callable[[int, str], bool]) ---
             PyreflyType::Callable(c) => self.convert_callable(c),
             PyreflyType::Overloaded(_) => self.convert(&PyreflyType::any_implicit()),
+            PyreflyType::QuantifiedCases(cases) => self.convert(&cases.erase()),
 
             // --- Unions ---
             PyreflyType::Union(u) => {

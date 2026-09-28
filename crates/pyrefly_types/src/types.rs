@@ -61,6 +61,7 @@ use crate::module::ModuleType;
 use crate::named_ints::NamedInts;
 use crate::param_spec::ParamSpec;
 use crate::quantified::Quantified;
+use crate::quantified_cases::QuantifiedCases;
 use crate::sentinel::Sentinel;
 use crate::series::SeriesSchema;
 use crate::shaped_array::IntTuple;
@@ -974,6 +975,8 @@ pub enum Type {
     Var(Var),
     /// The type of a value which is annotated with a type var.
     Quantified(Box<Quantified>),
+    /// A result that depends on which declared constraint a constrained type variable is solved to.
+    QuantifiedCases(Box<QuantifiedCases>),
     /// The type of type var _value_ itself, after it has been bound to a function or a class.
     /// This is equivalent to Type::TypeVar/ParamSpec/TypeVarTuple as a value, but when used
     /// in a type annotation, it becomes Type::Quantified.
@@ -1081,6 +1084,7 @@ impl Visit for Type {
             Type::Forall(x) => x.visit(f),
             Type::Var(x) => x.visit(f),
             Type::Quantified(x) => x.visit(f),
+            Type::QuantifiedCases(x) => x.visit(f),
             Type::QuantifiedValue(x) => x.visit(f),
             Type::ElementOfTypeVarTuple(x) => x.visit(f),
             Type::TypeGuard(x) => x.visit(f),
@@ -1145,6 +1149,7 @@ impl VisitMut for Type {
             Type::Forall(x) => x.visit_mut(f),
             Type::Var(x) => x.visit_mut(f),
             Type::Quantified(x) => x.visit_mut(f),
+            Type::QuantifiedCases(x) => x.visit_mut(f),
             Type::QuantifiedValue(x) => x.visit_mut(f),
             Type::ElementOfTypeVarTuple(x) => x.visit_mut(f),
             Type::TypeGuard(x) => x.visit_mut(f),
@@ -1469,6 +1474,17 @@ impl Type {
 
     fn visit_type_variables<'a>(&'a self, f: &mut dyn FnMut(TypeVariable<'a>)) {
         fn visit<'a>(ty: &'a Type, f: &mut dyn FnMut(TypeVariable<'a>)) {
+            if let Type::QuantifiedCases(cases) = ty {
+                match (cases.quantified(), cases.selector()) {
+                    (Some(q), _) => f(TypeVariable::Quantified(q)),
+                    (None, Some(selector)) => visit(selector, f),
+                    (None, None) => unreachable!("cases without a live quantified have a selector"),
+                }
+                for case in cases.cases() {
+                    visit(case, f);
+                }
+                return;
+            }
             if let Some(tv) = TypeVariable::new(ty) {
                 f(tv);
                 return;
@@ -1602,6 +1618,21 @@ impl Type {
             f: &mut dyn FnMut(&'a Quantified),
             in_scope: &mut Vec<&'a Quantified>,
         ) {
+            if let Type::QuantifiedCases(cases) = ty {
+                match (cases.quantified(), cases.selector()) {
+                    (Some(q), _) => {
+                        if !in_scope.contains(&q) {
+                            f(q);
+                        }
+                    }
+                    (None, Some(selector)) => visit(selector, f, in_scope),
+                    (None, None) => unreachable!("cases without a live quantified have a selector"),
+                }
+                for case in cases.cases() {
+                    visit(case, f, in_scope);
+                }
+                return;
+            }
             if let Type::Quantified(q) = ty {
                 if !in_scope.contains(&q.as_ref()) {
                     f(q);
@@ -1763,6 +1794,22 @@ impl Type {
                     && let Some(w) = mp(x)
                 {
                     *ty = w;
+                }
+            } else if let Type::QuantifiedCases(cases) = ty {
+                if let Some(resolved) = cases.resolve_selector() {
+                    *ty = resolved;
+                    f(ty, mp, shadowed);
+                    return;
+                }
+                cases.recurse_cases_mut(&mut |x| f(x, mp, shadowed));
+                // A pending selector is an unsolved variable, which substitution does not touch.
+                if let Some(q) = cases.quantified().cloned()
+                    && !shadowed.contains(&q)
+                    && let Some(w) = mp(&q)
+                {
+                    *ty = cases.select(w);
+                } else {
+                    *ty = cases.with_cases(cases.cases().to_vec());
                 }
             } else if matches!(
                 ty,

@@ -46,6 +46,7 @@ pub mod named_ints;
 pub mod param_spec;
 pub mod polars_dtype;
 pub mod quantified;
+pub mod quantified_cases;
 pub mod read_only;
 pub mod sentinel;
 pub mod series;
