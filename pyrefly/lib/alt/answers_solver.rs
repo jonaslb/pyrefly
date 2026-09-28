@@ -62,6 +62,7 @@ use crate::alt::answers::Solutions;
 use crate::alt::answers::SolutionsEntry;
 use crate::alt::answers::SolutionsTable;
 use crate::alt::answers::TraceSideEffects;
+use crate::alt::expr::specialize_cases;
 use crate::alt::traits::Solve;
 use crate::alt::traits::SolveResult;
 use crate::alt::types::class_metadata::DjangoReverseRelationIndex;
@@ -101,6 +102,7 @@ use crate::types::class::Class;
 use crate::types::class::ClassFields;
 use crate::types::equality::TypeEq;
 use crate::types::equality::TypeEqCtx;
+use crate::types::quantified::Quantified;
 use crate::types::stdlib::Stdlib;
 use crate::types::type_info::TypeInfo;
 use crate::types::types::Type;
@@ -1895,6 +1897,15 @@ impl Scc {
     }
 }
 
+/// Expression inference in which each `(q, index)` of `cases`, applied in order, specializes
+/// `q` to its `index`-th declared constraint.
+struct ExprCases {
+    /// Only names inferred at this `CalcStack` height are specialized. Keys calculated deeper
+    /// in the stack are cached, so they must not observe the specialization.
+    height: usize,
+    cases: Vec<(Quantified, usize)>,
+}
+
 /// Represents thread-local state for the current `AnswersSolver` and any
 /// `AnswersSolver`s waiting for the results that we are currently computing.
 ///
@@ -1923,6 +1934,8 @@ pub struct ThreadState {
     /// The `ModulePath` is needed to distinguish the in-memory and on-disk
     /// versions of the same module, which can coexist in the IDE (issue #3789).
     lambda_param_types: RefCell<FxHashMap<(ModuleName, ModulePath, LambdaParamId), Type>>,
+    /// The active per-constraint specialization of expression inference. See `with_expr_cases`.
+    expr_cases: RefCell<Option<ExprCases>>,
     /// Active trace side-effect sink for the current calculation.
     /// Set before `K::solve`, taken after. `None` when tracing is disabled
     /// or between calculations. Saved sinks form a stack to handle recursive
@@ -1954,6 +1967,7 @@ impl ThreadState {
             recursion_limit_config,
             partial_answers: RefCell::new(FxHashMap::default()),
             lambda_param_types: RefCell::new(FxHashMap::default()),
+            expr_cases: RefCell::new(None),
             trace_sink: RefCell::new(None),
             trace_sink_stack: RefCell::new(Vec::new()),
             overload_self_filter_stack: RefCell::new(FxHashSet::default()),
@@ -2254,6 +2268,45 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .borrow()
             .get(&(self.module().name(), self.module().path().dupe(), id))
             .cloned()
+    }
+
+    /// Run `f` with names at the current `CalcStack` height specialized by `cases`, composed
+    /// after any active specialization at the same height.
+    pub(crate) fn with_expr_cases<R>(
+        &self,
+        cases: &[(Quantified, usize)],
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore<'a>(&'a RefCell<Option<ExprCases>>, Option<ExprCases>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                *self.0.borrow_mut() = self.1.take();
+            }
+        }
+        let height = self.stack().len();
+        let outer = self.thread_state.expr_cases.borrow_mut().take();
+        let mut all_cases = match &outer {
+            Some(outer) if outer.height == height => outer.cases.clone(),
+            _ => Vec::new(),
+        };
+        all_cases.extend_from_slice(cases);
+        *self.thread_state.expr_cases.borrow_mut() = Some(ExprCases {
+            height,
+            cases: all_cases,
+        });
+        let _restore = Restore(&self.thread_state.expr_cases, outer);
+        f()
+    }
+
+    /// Specialize the type of a name by the active specialization, if it applies at the current
+    /// `CalcStack` height.
+    pub(crate) fn specialize_expr_cases(&self, ty: Type) -> Type {
+        match self.thread_state.expr_cases.borrow().as_ref() {
+            Some(expr_cases) if expr_cases.height == self.stack().len() => {
+                specialize_cases(ty, &expr_cases.cases)
+            }
+            _ => ty,
+        }
     }
 
     pub(crate) fn resolve_lambda_param_type(

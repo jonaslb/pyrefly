@@ -232,6 +232,9 @@ pub struct Bindings {
     /// keyed by the lambda's TextRange. Populated at binding time so the
     /// solver can look up yield info without re-walking the AST.
     lambda_yield_keys: Vec<(TextRange, Box<[Idx<KeyYield>]>, Box<[Idx<KeyYieldFrom>]>)>,
+    /// Ranges of lambdas whose bodies create keys other than `Key::BoundName`. See
+    /// `BindingsBuilder::bind_lambda`.
+    lambdas_with_body_keys: SmallSet<TextRange>,
     /// Class body ranges paired with class indices. Used by the solver to
     /// recover the enclosing class for an expression that resolves to
     /// `typing.Self`, without needing a per-`Self`-use bind-time key.
@@ -321,6 +324,8 @@ pub struct BindingsBuilder<'a> {
     deferred_bound_names: SmallMap<ShortIdentifier, DeferredBoundName>,
     /// Yield and yield-from indices for lambdas that contain yields.
     lambda_yield_keys: Vec<(TextRange, Box<[Idx<KeyYield>]>, Box<[Idx<KeyYieldFrom>]>)>,
+    /// Ranges of lambdas whose bodies create keys other than `Key::BoundName`.
+    lambdas_with_body_keys: SmallSet<TextRange>,
     next_lambda_param_id: u32,
     /// Class body ranges paired with class indices, populated as
     /// `class_def_inner` enters each class body. The solver uses this to
@@ -400,6 +405,7 @@ impl Bindings {
             unused_variables: Vec::new(),
             pytest_info: None,
             lambda_yield_keys: Vec::new(),
+            lambdas_with_body_keys: SmallSet::new(),
             class_scopes: Vec::new(),
             shape_declarations: ShapeDeclarations::default(),
             subsequently_initialized: SmallSet::new(),
@@ -472,6 +478,12 @@ impl Bindings {
     pub(crate) fn pytest_info(&self) -> Option<&PytestBindingInfo> {
         self.pytest_info.as_ref()
     }
+    /// Whether the body of the lambda at `range` creates keys other than `Key::BoundName`.
+    /// Such keys are cached, so they cannot depend on per-call contextual parameter types.
+    pub fn lambda_has_body_keys(&self, range: TextRange) -> bool {
+        self.lambdas_with_body_keys.contains(&range)
+    }
+
     /// Returns the yield and yield-from indices for a lambda at the given range,
     /// or empty slices if the lambda has no yields.
     pub fn lambda_yield_keys(&self, range: TextRange) -> (&[Idx<KeyYield>], &[Idx<KeyYieldFrom>]) {
@@ -692,6 +704,7 @@ impl Bindings {
             pytest_info,
             deferred_bound_names: SmallMap::new(),
             lambda_yield_keys: Vec::new(),
+            lambdas_with_body_keys: SmallSet::new(),
             next_lambda_param_id: 0,
             class_scopes: Vec::new(),
             shape_declarations: ShapeDeclarations::default(),
@@ -822,6 +835,7 @@ impl Bindings {
             unused_variables: builder.unused_variables,
             pytest_info: builder.pytest_info,
             lambda_yield_keys: builder.lambda_yield_keys,
+            lambdas_with_body_keys: builder.lambdas_with_body_keys,
             class_scopes: builder.class_scopes,
             shape_declarations: builder.shape_declarations.finish(),
             subsequently_initialized: builder.subsequently_initialized,
@@ -883,6 +897,14 @@ impl Bindings {
 }
 
 impl BindingTable {
+    /// The number of keys in each table other than `types`, summed.
+    fn non_type_key_count(&self) -> usize {
+        let mut count = 0;
+        table_for_each!(self, |entry: &BindingEntry<_>| count +=
+            entry.0.items().len());
+        count - self.types.0.items().len()
+    }
+
     pub fn insert<K: Keyed>(&mut self, key: K, value: K::Value) -> Idx<K>
     where
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
@@ -1105,6 +1127,28 @@ impl<'a> BindingsBuilder<'a> {
 
     pub fn record_unused_imports(&mut self, unused: Vec<UnusedImport>) {
         self.unused_imports.extend(unused);
+    }
+
+    /// Run `f`, which binds the body of the lambda at `range`, and record whether it created any
+    /// key other than `Key::BoundName`. A `Key::BoundName` read of a lambda parameter is solved
+    /// by a shortcut that is never cached, and one of a captured name forwards to a key outside
+    /// the lambda, which cannot depend on the lambda's parameters. Any other key created in the
+    /// body (e.g. for a comprehension, an assignment expression, a narrowing, or a nested lambda
+    /// body) is cached and may depend on the parameters.
+    pub fn record_lambda_body_keys(&mut self, range: TextRange, f: impl FnOnce(&mut Self)) {
+        let types = self.table.types.0.items().len();
+        let others = self.table.non_type_key_count();
+        f(self);
+        if self.table.non_type_key_count() != others
+            || (types..self.table.types.0.items().len()).any(|i| {
+                !matches!(
+                    self.table.types.0.idx_to_key(Idx::new(i)),
+                    Key::BoundName(_)
+                )
+            })
+        {
+            self.lambdas_with_body_keys.insert(range);
+        }
     }
 
     pub fn record_unused_variables(&mut self, unused: Vec<UnusedVariable>) {

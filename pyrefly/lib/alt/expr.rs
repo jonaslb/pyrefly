@@ -100,6 +100,7 @@ use crate::binding::binding::Binding;
 use crate::binding::binding::Key;
 use crate::binding::binding::KeyYield;
 use crate::binding::binding::KeyYieldFrom;
+use crate::binding::bindings::Bindings;
 use crate::binding::narrow::AtomicNarrowOp;
 use crate::binding::narrow::int_from_slice;
 use crate::config::error_kind::ErrorKind;
@@ -136,6 +137,18 @@ pub enum TypeOrExpr<'a> {
     /// Bundles a `Type` with a `TextRange`, allowing us to give good errors.
     Type(&'a Type, TextRange),
     Expr(&'a Expr),
+    /// An expression that is typed as if each `(q, index)` in the slice, applied in order,
+    /// specialized `q` to its `index`-th case. Only expressions that benefit from contextual
+    /// typing (lambdas and container literals) use this form; other expressions are inferred
+    /// eagerly and specialized into `Type`.
+    SpecializedExpr(&'a Expr, &'a [(Quantified, usize)]),
+}
+
+/// Apply each `(q, index)` specialization to `ty`, in order.
+pub fn specialize_cases(ty: Type, cases: &[(Quantified, usize)]) -> Type {
+    cases
+        .iter()
+        .fold(ty, |ty, (q, index)| ty.specialize_quantified(q, *index))
 }
 
 pub(crate) enum PreparedExprCall {
@@ -200,7 +213,7 @@ impl Ranged for TypeOrExpr<'_> {
     fn range(&self) -> TextRange {
         match self {
             TypeOrExpr::Type(_, range) => *range,
-            TypeOrExpr::Expr(expr) => expr.range(),
+            TypeOrExpr::Expr(expr) | TypeOrExpr::SpecializedExpr(expr, _) => expr.range(),
         }
     }
 }
@@ -216,6 +229,49 @@ impl<'a> TypeOrExpr<'a> {
         match self {
             TypeOrExpr::Type(ty, _) => ty.clone(),
             TypeOrExpr::Expr(x) => solver.expr_infer(x, errors),
+            TypeOrExpr::SpecializedExpr(x, cases) => {
+                specialize_cases(solver.expr_infer(x, errors), cases)
+            }
+        }
+    }
+
+    /// Check against `want`, returning the argument type. `Type` values are checked directly,
+    /// and expressions are contextually typed against `want`.
+    pub fn check<Ans: LookupAnswer>(
+        self,
+        solver: &AnswersSolver<Ans>,
+        want: &Type,
+        errors: &ErrorCollector,
+        check_errors: &ErrorCollector,
+        tcc: &dyn Fn() -> TypeCheckContext,
+        call_context: Option<&CallContext>,
+    ) -> Type {
+        match self {
+            TypeOrExpr::Type(ty, range) => {
+                let options = TypeCheckOptions::new(check_errors, tcc);
+                solver.check_type_with_options(
+                    ty,
+                    want,
+                    range,
+                    match call_context {
+                        Some(call_context) => options.with_call_context(call_context),
+                        None => options,
+                    },
+                );
+                ty.clone()
+            }
+            TypeOrExpr::Expr(x) => {
+                solver.expr_check_specialized(x, &[], want, errors, check_errors, tcc, call_context)
+            }
+            TypeOrExpr::SpecializedExpr(x, cases) => solver.expr_check_specialized(
+                x,
+                cases,
+                want,
+                errors,
+                check_errors,
+                tcc,
+                call_context,
+            ),
         }
     }
 
@@ -466,6 +522,82 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .into_ty()
     }
 
+    /// Check `x` against `want` as if each `(q, index)` in `cases` specialized `q` to its
+    /// `index`-th case, returning the specialized type.
+    ///
+    /// Names read directly by `x` are specialized while it is inferred (see `with_expr_cases`),
+    /// but other values of type `q` inside it may be incompatible with `want` until the result is
+    /// specialized. `want` is therefore only a soft hint: it still guides inference (such as
+    /// lambda parameter types and container element types) but never reports errors itself.
+    /// The specialized result is then checked against `want`. In each case, `x` is inferred
+    /// once, and inference errors are reported normally.
+    ///
+    /// Each constraint installs different contextual lambda parameter types, but cached keys
+    /// inside a lambda body would only observe one of them. Calls infer such lambda arguments
+    /// once for all constraints beforehand (see `CallWithTypes::infer_case_lambdas`). Any other
+    /// argument containing a lambda whose body creates such keys (see
+    /// `Bindings::lambda_has_body_keys`) is rejected, after inferring it so that errors in the
+    /// lambda body are still reported.
+    pub fn expr_check_specialized(
+        &self,
+        x: &Expr,
+        cases: &[(Quantified, usize)],
+        want: &Type,
+        errors: &ErrorCollector,
+        check_errors: &ErrorCollector,
+        tcc: &dyn Fn() -> TypeCheckContext,
+        call_context: Option<&CallContext>,
+    ) -> Type {
+        fn has_lambda_with_body_keys(bindings: &Bindings, x: &Expr) -> bool {
+            match x {
+                // Keys in nested lambdas are created in the body of the outer lambda.
+                Expr::Lambda(lambda) => bindings.lambda_has_body_keys(lambda.range),
+                _ => {
+                    let mut found = false;
+                    x.recurse(&mut |child: &Expr| {
+                        found = found || has_lambda_with_body_keys(bindings, child)
+                    });
+                    found
+                }
+            }
+        }
+        if cases.is_empty() {
+            return self
+                .expr_with_options(
+                    x,
+                    ExprOptions::check(want, errors, check_errors, tcc, call_context),
+                )
+                .into_ty();
+        }
+        let ty = specialize_cases(
+            self.with_expr_cases(cases, || {
+                self.expr_infer_with_hint(x, Some(HintRef::soft(want)), errors)
+            }),
+            cases,
+        );
+        if has_lambda_with_body_keys(self.bindings(), x) {
+            return self.error(
+                check_errors,
+                x.range(),
+                ErrorKind::BadArgumentType,
+                "Cannot check this argument separately for each constraint of a type variable, \
+                 because its lambda body requires cached bindings"
+                    .to_owned(),
+            );
+        }
+        let options = TypeCheckOptions::new(check_errors, tcc);
+        self.check_type_with_options(
+            &ty,
+            want,
+            x.range(),
+            match call_context {
+                Some(call_context) => options.with_call_context(call_context),
+                None => options,
+            },
+        );
+        ty
+    }
+
     /// Infer a type for an expression, with an optional type hint that influences the inferred type.
     /// Convenience wrapper around `expr_with_options`.
     pub fn expr_infer_with_hint(
@@ -534,7 +666,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 } else {
                     let result = self
                         .get(&Key::BoundName(ShortIdentifier::expr_name(x)))
-                        .clone();
+                        .clone()
+                        .map_ty(|ty| self.specialize_expr_cases(ty));
                     // Complements PromoteForward for seeded captures.
                     if self.bindings().should_promote_at_range(x.range) {
                         result.map_ty(|ty| ty.promote_shallow_implicit_literals(self.stdlib))

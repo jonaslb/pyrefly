@@ -1557,10 +1557,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         };
 
         let infer_type_or_expr = |toe: TypeOrExpr, errors: &ErrorCollector| -> Type {
-            let ty = match toe {
-                TypeOrExpr::Type(ty, _) => ty.clone(),
-                TypeOrExpr::Expr(e) => self.expr_infer(e, errors),
-            };
+            let ty = toe.infer(self, errors);
             // NNModule fields carry captured constructor args (e.g., padding=Literal[1]) that DSL
             // forward functions need as literals to compute output shapes.
             ty.with_literal_style(LitStyle::Explicit)

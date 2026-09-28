@@ -1160,6 +1160,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     TypeOrExpr::Expr(got) => {
                         self.expr_check(got, Some((&ty, &type_check_context)), errors)
                     }
+                    TypeOrExpr::SpecializedExpr(got, cases) => self.expr_check_specialized(
+                        got,
+                        cases,
+                        &ty,
+                        errors,
+                        errors,
+                        &type_check_context,
+                        None,
+                    ),
                     TypeOrExpr::Type(got, _) => {
                         self.check_type(got, &ty, range, errors, &type_check_context);
                         got.clone()

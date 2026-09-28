@@ -30,8 +30,10 @@ use pyrefly_util::prelude::VecExt;
 use pyrefly_util::visit::Visit;
 use pyrefly_util::visit::VisitMut;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprLambda;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::Keyword;
+use ruff_python_ast::ParameterWithDefault;
 use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
@@ -44,6 +46,7 @@ use crate::alt::answers_solver::AnswersSolver;
 use crate::alt::answers_solver::TypeCheckOptions;
 use crate::alt::expr::ExprOptions;
 use crate::alt::expr::TypeOrExpr;
+use crate::alt::expr::specialize_cases;
 use crate::alt::map_int_tuples::MapIntTuplesPatternArgument;
 use crate::alt::map_int_tuples::map_int_tuples_parameter_pattern;
 use crate::alt::shape_extension::NamedIntsCapture;
@@ -107,12 +110,101 @@ fn nests_calls_to_depth(x: &Expr, depth: u32) -> bool {
 /// Structure to turn TypeOrExprs into Types.
 /// This is used to avoid re-inferring types for arguments multiple times.
 ///
-/// Implemented by keeping an `Owner` to hand out references to `Type`.
-pub struct CallWithTypes(Owner<Type>);
+/// Implemented by keeping `Owner`s to hand out references to `Type`s and to the quantified
+/// specializations of `TypeOrExpr::SpecializedExpr` arguments.
+pub struct CallWithTypes {
+    types: Owner<Type>,
+    cases: Owner<Vec<(Quantified, usize)>>,
+}
 
 impl CallWithTypes {
     pub fn new() -> Self {
-        Self(Owner::new())
+        Self {
+            types: Owner::new(),
+            cases: Owner::new(),
+        }
+    }
+
+    /// Whether `e` stays an expression so that it can be contextually typed against its
+    /// parameter type. Mutable builtin containers are kept as expressions unless nesting depth
+    /// reaches or exceeds `MIN_FLATTEN_CALL_DEPTH`, to avoid exponential blowup.
+    fn keeps_expr(e: &Expr) -> bool {
+        match e {
+            Expr::Lambda(_) => true,
+            Expr::Dict(_) | Expr::List(_) | Expr::Set(_) => {
+                !nests_calls_to_depth(e, MIN_FLATTEN_CALL_DEPTH)
+            }
+            _ => false,
+        }
+    }
+
+    /// Convert `x` to a type, keeping contextually typed expressions. With `case = Some((q,
+    /// index))`, the result is additionally specialized to case `index` of `q`: types are
+    /// specialized immediately, and kept expressions record the specialization so that it is
+    /// applied after contextual typing.
+    fn convert<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        x: TypeOrExpr<'b>,
+        case: Option<(&Quantified, usize)>,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> TypeOrExpr<'a> {
+        let extend = |cases: &[(Quantified, usize)], q: &Quantified, index: usize| {
+            let mut cases = cases.to_vec();
+            cases.push((q.clone(), index));
+            self.cases.push(cases).as_slice()
+        };
+        match x {
+            TypeOrExpr::Expr(e) if Self::keeps_expr(e) => match case {
+                None => TypeOrExpr::Expr(e),
+                Some((q, index)) => TypeOrExpr::SpecializedExpr(e, extend(&[], q, index)),
+            },
+            TypeOrExpr::Expr(e) => {
+                let t = solver.expr_infer(e, errors);
+                let t = match case {
+                    None => t,
+                    Some((q, index)) => t.specialize_quantified(q, index),
+                };
+                TypeOrExpr::Type(self.types.push(t), e.range())
+            }
+            TypeOrExpr::SpecializedExpr(e, cases) => match case {
+                None => TypeOrExpr::SpecializedExpr(e, cases),
+                Some((q, index)) => TypeOrExpr::SpecializedExpr(e, extend(cases, q, index)),
+            },
+            TypeOrExpr::Type(t, r) => match case {
+                None => TypeOrExpr::Type(t, r),
+                Some((q, index)) => {
+                    TypeOrExpr::Type(self.types.push(t.specialize_quantified(q, index)), r)
+                }
+            },
+        }
+    }
+
+    fn convert_call_arg<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        x: &CallArg<'b>,
+        case: Option<(&Quantified, usize)>,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> CallArg<'a> {
+        match x {
+            CallArg::Arg(x) => CallArg::Arg(self.convert(*x, case, solver, errors)),
+            CallArg::Star(x, r) => CallArg::Star(self.convert(*x, case, solver, errors), *r),
+        }
+    }
+
+    fn convert_call_keyword<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        x: &CallKeyword<'b>,
+        case: Option<(&Quantified, usize)>,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> CallKeyword<'a> {
+        CallKeyword {
+            range: x.range,
+            arg: x.arg,
+            value: self.convert(x.value, case, solver, errors),
+        }
     }
 
     pub fn type_or_expr<'a, 'b: 'a, Ans: LookupAnswer>(
@@ -121,22 +213,7 @@ impl CallWithTypes {
         solver: &AnswersSolver<Ans>,
         errors: &ErrorCollector,
     ) -> TypeOrExpr<'a> {
-        match x {
-            TypeOrExpr::Expr(e @ Expr::Lambda(_)) => TypeOrExpr::Expr(e),
-            TypeOrExpr::Expr(e @ (Expr::Dict(_) | Expr::List(_) | Expr::Set(_)))
-                if !nests_calls_to_depth(e, MIN_FLATTEN_CALL_DEPTH) =>
-            {
-                // Hack: keep mutable builtin containers as expressions, since they often need to be
-                // contextually typed against the function's parameter types, unless nesting depth
-                // reaches or exceeds `MIN_FLATTEN_CALL_DEPTH` to avoid exponential blowup.
-                TypeOrExpr::Expr(e)
-            }
-            TypeOrExpr::Expr(e) => {
-                let t = solver.expr_infer(e, errors);
-                TypeOrExpr::Type(self.0.push(t), e.range())
-            }
-            TypeOrExpr::Type(t, r) => TypeOrExpr::Type(t, r),
-        }
+        self.convert(x, None, solver, errors)
     }
 
     pub fn call_arg<'a, 'b: 'a, Ans: LookupAnswer>(
@@ -145,10 +222,7 @@ impl CallWithTypes {
         solver: &AnswersSolver<Ans>,
         errors: &ErrorCollector,
     ) -> CallArg<'a> {
-        match x {
-            CallArg::Arg(x) => CallArg::Arg(self.type_or_expr(*x, solver, errors)),
-            CallArg::Star(x, r) => CallArg::Star(self.type_or_expr(*x, solver, errors), *r),
-        }
+        self.convert_call_arg(x, None, solver, errors)
     }
 
     pub fn call_keyword<'a, 'b: 'a, Ans: LookupAnswer>(
@@ -157,11 +231,7 @@ impl CallWithTypes {
         solver: &AnswersSolver<Ans>,
         errors: &ErrorCollector,
     ) -> CallKeyword<'a> {
-        CallKeyword {
-            range: x.range,
-            arg: x.arg,
-            value: self.type_or_expr(x.value, solver, errors),
-        }
+        self.convert_call_keyword(x, None, solver, errors)
     }
 
     pub fn vec_call_arg<'a, 'b: 'a, Ans: LookupAnswer>(
@@ -170,7 +240,7 @@ impl CallWithTypes {
         solver: &AnswersSolver<Ans>,
         errors: &ErrorCollector,
     ) -> Vec<CallArg<'a>> {
-        xs.map(|x| self.call_arg(x, solver, errors))
+        xs.map(|x| self.convert_call_arg(x, None, solver, errors))
     }
 
     pub fn vec_call_keyword<'a, 'b: 'a, Ans: LookupAnswer>(
@@ -179,7 +249,204 @@ impl CallWithTypes {
         solver: &AnswersSolver<Ans>,
         errors: &ErrorCollector,
     ) -> Vec<CallKeyword<'a>> {
-        xs.map(|x| self.call_keyword(x, solver, errors))
+        xs.map(|x| self.convert_call_keyword(x, None, solver, errors))
+    }
+
+    /// Like `vec_call_arg`, but every argument is typed as if `q` were specialized to its
+    /// `index`-th case. Specializations compose: converting already specialized arguments again
+    /// applies both, in order, without forcing contextually typed expressions.
+    pub fn specialized_vec_call_arg<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        xs: &[CallArg<'b>],
+        q: &Quantified,
+        index: usize,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> Vec<CallArg<'a>> {
+        xs.map(|x| self.convert_call_arg(x, Some((q, index)), solver, errors))
+    }
+
+    /// Like `vec_call_keyword`, but specialized as in `specialized_vec_call_arg`.
+    pub fn specialized_vec_call_keyword<'a, 'b: 'a, Ans: LookupAnswer>(
+        &'a self,
+        xs: &[CallKeyword<'b>],
+        q: &Quantified,
+        index: usize,
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+    ) -> Vec<CallKeyword<'a>> {
+        xs.map(|x| self.convert_call_keyword(x, Some((q, index)), solver, errors))
+    }
+
+    /// Infer each lambda argument whose body creates cached keys (see
+    /// `Bindings::lambda_has_body_keys`) once for all `count` cases of a call, and replace it
+    /// with its type, which each case then checks like any other argument type.
+    ///
+    /// Inferring such a lambda separately per case would be unsound, because its cached keys
+    /// would only observe the parameter types of whichever case is inferred first. Instead,
+    /// `probe(index, args, keywords, errors)` checks case `index` with each such lambda replaced
+    /// by a callable whose parameter types are fresh variables, which records the lambda's
+    /// contextual parameter types in that case. The lambda is then inferred with the union of
+    /// its contextual parameter types across all cases, so its type accepts the parameters of
+    /// every case.
+    ///
+    /// Probes are speculative: the variables reachable from `types` (which must cover the types
+    /// the probe reads besides the arguments) and from the argument types are restored after
+    /// each probe. So that a probe only evaluates argument types, the lambdas are left in place
+    /// if any other argument is still an expression. They are also left in place if some probe
+    /// reports an error, leaves a parameter type that mentions a variable, or gives a
+    /// parameter a contextual type in only some cases.
+    pub fn infer_case_lambdas<'a, Ans: LookupAnswer>(
+        &'a self,
+        args: &mut [CallArg<'a>],
+        keywords: &mut [CallKeyword<'a>],
+        count: usize,
+        types: &[&Type],
+        solver: &AnswersSolver<Ans>,
+        errors: &ErrorCollector,
+        probe: impl Fn(usize, &[CallArg], &[CallKeyword], &ErrorCollector),
+    ) {
+        /// The parameters of `lambda`, with each type taken in order from `ty`.
+        fn lambda_params(lambda: &ExprLambda, mut ty: impl FnMut() -> Type) -> Vec<Param> {
+            let Some(parameters) = &lambda.parameters else {
+                return Vec::new();
+            };
+            let required = |x: &ParameterWithDefault| match x.default {
+                Some(_) => Required::Optional(None),
+                None => Required::Required,
+            };
+            let mut params = Vec::new();
+            for x in &parameters.posonlyargs {
+                params.push(Param::PosOnly(Some(x.name().id.clone()), ty(), required(x)));
+            }
+            for x in &parameters.args {
+                params.push(Param::Pos(x.name().id.clone(), ty(), required(x)));
+            }
+            if let Some(x) = &parameters.vararg {
+                params.push(Param::Varargs(Some(x.name.id.clone()), ty()));
+            }
+            for x in &parameters.kwonlyargs {
+                params.push(Param::KwOnly(x.name().id.clone(), ty(), required(x)));
+            }
+            if let Some(x) = &parameters.kwarg {
+                params.push(Param::Kwargs(Some(x.name.id.clone()), ty()));
+            }
+            params
+        }
+        let mut lambdas = Vec::new();
+        let mut arg_types = types.to_vec();
+        let values = args
+            .iter()
+            .map(|arg| match arg {
+                CallArg::Arg(x) => (x, false),
+                CallArg::Star(x, _) => (x, true),
+            })
+            .chain(keywords.iter().map(|kw| (&kw.value, false)));
+        // Lambda arguments are identified by their position among `args` followed by `keywords`.
+        for (position, (value, star)) in values.enumerate() {
+            match value {
+                TypeOrExpr::Type(ty, _) => arg_types.push(ty),
+                TypeOrExpr::Expr(expr @ Expr::Lambda(lambda))
+                    if !star && solver.bindings().lambda_has_body_keys(lambda.range) =>
+                {
+                    lambdas.push((position, *expr, lambda))
+                }
+                TypeOrExpr::Expr(_) | TypeOrExpr::SpecializedExpr(..) => return,
+            }
+        }
+        if lambdas.is_empty() {
+            return;
+        }
+        let mut param_tys = lambdas.map(|_| Vec::new());
+        for index in 0..count {
+            let mut args = args.to_vec();
+            let mut keywords = keywords.to_vec();
+            let snapshot = solver.solver().snapshot_reachable_vars(&arg_types);
+            let mut vars = lambdas.map(|_| Vec::new());
+            let probes = lambdas
+                .iter()
+                .zip(&mut vars)
+                .map(|((_, _, lambda), vars)| {
+                    let params = lambda_params(lambda, || {
+                        let var = solver.solver().fresh_unwrap(solver.uniques);
+                        vars.push(var);
+                        var.to_type(solver.heap)
+                    });
+                    let ret = solver.solver().fresh_unwrap(solver.uniques);
+                    solver
+                        .heap
+                        .mk_callable_from_vec(params, ret.to_type(solver.heap))
+                })
+                .collect::<Vec<_>>();
+            for ((position, _, lambda), ty) in lambdas.iter().zip(&probes) {
+                let value = TypeOrExpr::Type(ty, lambda.range);
+                match args.get_mut(*position) {
+                    Some(arg) => *arg = CallArg::Arg(value),
+                    None => keywords[position - args.len()].value = value,
+                }
+            }
+            let probe_errors = solver.error_collector();
+            probe(index, &args, &keywords, &probe_errors);
+            // Expand the parameter types before restoring, and require them to be closed so
+            // that no restored variable escapes the probe.
+            let ok = !probe_errors.has_hard()
+                && vars.iter().zip(&mut param_tys).all(|(vars, param_tys)| {
+                    vars.iter()
+                        .all(|var| match solver.solver().expand_unwrap(*var) {
+                            Type::Var(_) => {
+                                param_tys.push(None);
+                                true
+                            }
+                            ty => {
+                                let closed = ty.collect_all_vars().is_empty();
+                                param_tys.push(Some(ty));
+                                closed
+                            }
+                        })
+                });
+            solver.solver().restore_vars(snapshot);
+            if !ok {
+                return;
+            }
+        }
+        for ((position, expr, lambda), param_tys) in lambdas.into_iter().zip(param_tys) {
+            // `param_tys` lists the parameter types of each case in turn. A parameter without
+            // a contextual type in any case gets a fresh variable, which leaves it unhinted.
+            let width = param_tys.len() / count;
+            let Some(unions) = (0..width)
+                .map(|i| {
+                    let tys = param_tys.iter().skip(i).step_by(width);
+                    match tys.clone().cloned().collect::<Option<Vec<_>>>() {
+                        Some(tys) => Some(solver.unions(tys)),
+                        None if tys.clone().all(Option::is_none) => Some(
+                            solver
+                                .solver()
+                                .fresh_unwrap(solver.uniques)
+                                .to_type(solver.heap),
+                        ),
+                        None => None,
+                    }
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let mut unions = unions.into_iter();
+            let params = lambda_params(lambda, || unions.next().expect("one type per parameter"));
+            // The return type is left unconstrained, because a case's contextual return type
+            // may mention type variables of that case's callee.
+            let ret = solver
+                .solver()
+                .fresh_unwrap(solver.uniques)
+                .to_type(solver.heap);
+            let hint = solver.heap.mk_callable_from_vec(params, ret);
+            let ty = solver.expr_infer_with_hint(expr, Some(HintRef::soft(&hint)), errors);
+            let value = TypeOrExpr::Type(self.types.push(ty), lambda.range);
+            match args.get_mut(position) {
+                Some(arg) => *arg = CallArg::Arg(value),
+                None => keywords[position - args.len()].value = value,
+            }
+        }
     }
 }
 
@@ -332,11 +599,19 @@ impl<'a> CallArg<'a> {
     ) -> CallArgPreEval<'_> {
         match self {
             Self::Arg(TypeOrExpr::Type(ty, _)) => CallArgPreEval::Type(ty, false),
-            Self::Arg(TypeOrExpr::Expr(e)) => CallArgPreEval::Expr(e, false),
+            Self::Arg(TypeOrExpr::Expr(e)) => CallArgPreEval::Expr(e, &[], false),
+            Self::Arg(TypeOrExpr::SpecializedExpr(e, cases)) => {
+                CallArgPreEval::Expr(e, cases, false)
+            }
             Self::Star(e, _range) => {
                 // Special-case list/set/tuple literals with statically known element count.
                 // Only do this if there are no starred elements inside the literal.
-                if let TypeOrExpr::Expr(expr) = e {
+                let expression = match e {
+                    TypeOrExpr::Expr(expr) => Some((*expr, &[][..])),
+                    TypeOrExpr::SpecializedExpr(expr, cases) => Some((*expr, *cases)),
+                    TypeOrExpr::Type(..) => None,
+                };
+                if let Some((expr, cases)) = expression {
                     let literal_elts: Option<&[Expr]> = match expr {
                         Expr::List(list_expr) => Some(&list_expr.elts),
                         Expr::Set(set_expr) => Some(&set_expr.elts),
@@ -348,7 +623,9 @@ impl<'a> CallArg<'a> {
                         if !has_starred {
                             let tys: Vec<Type> = elts
                                 .iter()
-                                .map(|elt| solver.expr_infer(elt, arg_errors))
+                                .map(|elt| {
+                                    specialize_cases(solver.expr_infer(elt, arg_errors), cases)
+                                })
                                 .collect();
                             return CallArgPreEval::Fixed(tys, 0);
                         }
@@ -415,7 +692,8 @@ impl<'a> CallArg<'a> {
 #[derive(Clone, Debug)]
 enum CallArgPreEval<'a> {
     Type(&'a Type, bool),
-    Expr(&'a Expr, bool),
+    /// An expression, typed as if each `(q, index)` specialized `q` to its `index`-th case.
+    Expr(&'a Expr, &'a [(Quantified, usize)], bool),
     Star {
         prefix: Vec<Type>,
         middle: Type,
@@ -429,7 +707,7 @@ enum CallArgPreEval<'a> {
 impl CallArgPreEval<'_> {
     fn step(&self) -> bool {
         match self {
-            Self::Type(_, done) | Self::Expr(_, done) | Self::Star { done, .. } => !*done,
+            Self::Type(_, done) | Self::Expr(_, _, done) | Self::Star { done, .. } => !*done,
             Self::Fixed(tys, i) => *i < tys.len(),
         }
     }
@@ -465,7 +743,9 @@ impl CallArgPreEval<'_> {
     ) -> Type {
         match self {
             Self::Type(ty, _) => (*ty).clone(),
-            Self::Expr(expr, _) => solver.expr_infer(expr, arg_errors),
+            Self::Expr(expr, cases, _) => {
+                specialize_cases(solver.expr_infer(expr, arg_errors), cases)
+            }
             Self::Star {
                 prefix,
                 middle,
@@ -480,7 +760,7 @@ impl CallArgPreEval<'_> {
     /// Advance past one matched parameter without changing how its argument is interpreted.
     fn advance_after_match(&mut self, vararg: bool) {
         match self {
-            Self::Type(_, done) | Self::Expr(_, done) => *done = true,
+            Self::Type(_, done) | Self::Expr(_, _, done) => *done = true,
             Self::Star {
                 prefix,
                 consumed,
@@ -526,7 +806,11 @@ impl CallArgPreEval<'_> {
         if let Some(pattern) = map_int_tuples_parameter_pattern(hint) {
             let argument = match self {
                 Self::Type(ty, _) => MapIntTuplesPatternArgument::Type((*ty).clone()),
-                Self::Expr(expr, _) => MapIntTuplesPatternArgument::Expr(expr),
+                Self::Expr(expr, [], _) => MapIntTuplesPatternArgument::Expr(expr),
+                Self::Expr(expr, cases, _) => MapIntTuplesPatternArgument::Type(specialize_cases(
+                    solver.expr_infer(expr, arg_errors),
+                    cases,
+                )),
                 Self::Star {
                     prefix,
                     middle,
@@ -574,8 +858,8 @@ impl CallArgPreEval<'_> {
                 solver.maybe_error_unknown_argument_type(&ty, range, arg_errors);
                 Some(ty)
             }
-            Self::Expr(x, _) => {
-                let x = *x;
+            Self::Expr(x, cases, _) => {
+                let (x, cases) = (*x, *cases);
                 self.advance_after_match(vararg);
                 // PEP 747: when the parameter type is TypeForm, evaluate
                 // string literal arguments as forward-reference type forms.
@@ -596,9 +880,10 @@ impl CallArgPreEval<'_> {
                     solver.canonicalize_shape_dsl_type(hint.clone()),
                     Type::ShapedArray(_)
                 ) {
-                    let ty = solver.reproject_tuple_carrier_shape(
-                        solver.canonicalize_shape_dsl_type(solver.expr_infer(x, arg_errors)),
-                    );
+                    let ty =
+                        solver.reproject_tuple_carrier_shape(solver.canonicalize_shape_dsl_type(
+                            specialize_cases(solver.expr_infer(x, arg_errors), cases),
+                        ));
                     solver.check_type_with_options(
                         &ty,
                         hint,
@@ -608,12 +893,15 @@ impl CallArgPreEval<'_> {
                     solver.maybe_error_unknown_argument_type(&ty, range, arg_errors);
                     return Some(ty);
                 }
-                let ty = solver
-                    .expr_with_options(
-                        x,
-                        ExprOptions::check(hint, arg_errors, call_errors, tcc, Some(call_context)),
-                    )
-                    .into_ty();
+                let ty = solver.expr_check_specialized(
+                    x,
+                    cases,
+                    hint,
+                    arg_errors,
+                    call_errors,
+                    tcc,
+                    Some(call_context),
+                );
                 solver.maybe_error_unknown_argument_type(&ty, range, arg_errors);
                 Some(ty)
             }
@@ -653,7 +941,7 @@ impl CallArgPreEval<'_> {
     // Intended for arguments matched to unpack-annotated *args, which are typechecked separately later
     fn post_skip(&mut self) {
         match self {
-            Self::Type(_, done) | Self::Expr(_, done) | Self::Star { done, .. } => {
+            Self::Type(_, done) | Self::Expr(_, _, done) | Self::Star { done, .. } => {
                 *done = true;
             }
             Self::Fixed(_, i) => {
@@ -665,7 +953,7 @@ impl CallArgPreEval<'_> {
     // Similar to post_skip but it skips to the end of any fixed length arguments.
     fn mark_done(&mut self) {
         match self {
-            Self::Type(_, done) | Self::Expr(_, done) | Self::Star { done, .. } => {
+            Self::Type(_, done) | Self::Expr(_, _, done) | Self::Star { done, .. } => {
                 *done = true;
             }
             Self::Fixed(tys, i) => {
@@ -680,7 +968,7 @@ impl CallArgPreEval<'_> {
         arg_errors: &ErrorCollector,
     ) {
         match self {
-            Self::Expr(x, _) => {
+            Self::Expr(x, _, _) => {
                 solver.expr_infer(x, arg_errors);
             }
             _ => {}
@@ -978,7 +1266,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 continue;
             }
             match kw.value {
-                TypeOrExpr::Expr(Expr::Dict(dict)) => {
+                TypeOrExpr::Expr(Expr::Dict(dict))
+                | TypeOrExpr::SpecializedExpr(Expr::Dict(dict), _) => {
                     for item in &dict.items {
                         let Some(Expr::StringLiteral(lit)) = item.key.as_ref() else {
                             continue;
@@ -994,6 +1283,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         keyword_arg_names.insert(Name::new(key.as_str()));
                     }
                 }
+                // Other specialized expressions are lambdas, lists, and sets, which have no keys.
+                TypeOrExpr::SpecializedExpr(..) => {}
                 TypeOrExpr::Type(ty, _) => match ty {
                     Type::TypedDict(typed_dict) | Type::PartialTypedDict(typed_dict) => {
                         for (name, field) in self.typed_dict_fields(typed_dict) {
@@ -1131,33 +1422,34 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         let unhinted_arg_ty = bound_args
                             .as_ref()
                             .map(|_| arg_pre.inferred_type(self, arg_errors));
-                        let arg_ty = if matches!(arg_pre, CallArgPreEval::Expr(Expr::Lambda(_), _))
-                            && bound_args.is_none()
-                        {
-                            deferred_lambdas.push((
-                                arg_pre.clone(),
-                                ty,
-                                name,
-                                arg.range(),
-                                argument,
-                            ));
-                            arg_pre.mark_done();
-                            None
-                        } else {
-                            arg_pre.post_check(
-                                self,
-                                callable_name,
-                                ty,
-                                name,
-                                false,
-                                is_self_arg,
-                                arg.range(),
-                                arg_errors,
-                                call_errors,
-                                context,
-                                call_context,
-                            )
-                        };
+                        let arg_ty =
+                            if matches!(arg_pre, CallArgPreEval::Expr(Expr::Lambda(_), _, _))
+                                && bound_args.is_none()
+                            {
+                                deferred_lambdas.push((
+                                    arg_pre.clone(),
+                                    ty,
+                                    name,
+                                    arg.range(),
+                                    argument,
+                                ));
+                                arg_pre.mark_done();
+                                None
+                            } else {
+                                arg_pre.post_check(
+                                    self,
+                                    callable_name,
+                                    ty,
+                                    name,
+                                    false,
+                                    is_self_arg,
+                                    arg.range(),
+                                    arg_errors,
+                                    call_errors,
+                                    context,
+                                    call_context,
+                                )
+                            };
                         if let Some(name) = name
                             && let Some(ty) = unhinted_arg_ty.or(arg_ty)
                         {
@@ -1253,9 +1545,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             for (arg, range) in unpacked_vararg_matched_args {
                 let ty = match arg {
                     CallArgPreEval::Type(ty, _) => ty.clone(),
-                    CallArgPreEval::Expr(e, _) => {
+                    CallArgPreEval::Expr(e, cases, _) => {
                         let before = arg_errors.len_hard();
-                        let ty = self.expr_infer(e, arg_errors);
+                        let ty = specialize_cases(self.expr_infer(e, arg_errors), cases);
                         if map_pattern.is_some() && arg_errors.len_hard() > before {
                             self.heap.mk_any_error()
                         } else {
@@ -1788,6 +2080,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     {
                         let argument = match kw.value {
                             TypeOrExpr::Expr(expr) => MapIntTuplesPatternArgument::Expr(expr),
+                            TypeOrExpr::SpecializedExpr(..) => {
+                                MapIntTuplesPatternArgument::Type(kw.value.infer(self, arg_errors))
+                            }
                             TypeOrExpr::Type(ty, _) => {
                                 MapIntTuplesPatternArgument::Type((*ty).clone())
                             }
@@ -1819,6 +2114,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     },
                                 )
                                 .into_ty(),
+                            TypeOrExpr::SpecializedExpr(x, cases) => match hint {
+                                Some((_, ty)) => self.expr_check_specialized(
+                                    x,
+                                    cases,
+                                    ty,
+                                    arg_errors,
+                                    call_errors,
+                                    tcc,
+                                    Some(call_context),
+                                ),
+                                None => kw.value.infer(self, arg_errors),
+                            },
                             TypeOrExpr::Type(x, range) => {
                                 if let Some((_, hint)) = &hint
                                     && !hint.is_any()

@@ -569,7 +569,9 @@ impl<'a> BindingsBuilder<'a> {
                 self.bind_lambda_param(x.name(), kind, usage);
             }
         }
-        self.ensure_expr(&mut lambda.body, usage);
+        self.record_lambda_body_keys(lambda.range, |this| {
+            this.ensure_expr(&mut lambda.body, usage)
+        });
         let (yields_and_returns, _, _, _) = self.scopes.pop_function_scope();
         let mut yield_keys = Vec::new();
         for (idx, y, is_unreachable) in yields_and_returns.yields {
