@@ -82,6 +82,15 @@ impl<'a, 'b> HintRef<'a, 'b> {
         self.0
     }
 
+    /// Transform the hint alternatives while keeping ordinary union normalization.
+    pub fn map_types<Ans: LookupAnswer>(
+        &self,
+        solver: &AnswersSolver<Ans>,
+        f: impl FnMut(&Type) -> Type,
+    ) -> Type {
+        solver.unions(self.types().iter().map(f).collect())
+    }
+
     pub fn errors(&self) -> Option<&ErrorCollector> {
         self.1
     }
@@ -309,6 +318,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Warning: this returns `Some` if the type is `Any` or a class that extends `Any`
     pub fn unwrap_iterable(&self, ty: &Type) -> Option<Type> {
+        // Unwrap each case separately so the element type stays indexed by the same constraint.
+        if let Type::QuantifiedCases(cases) = ty {
+            let elements = cases
+                .cases()
+                .iter()
+                .map(|case| self.unwrap_iterable(case))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(cases.with_cases(elements));
+        }
         let iter_ty = self.fresh_var();
         let iterable_ty = self
             .heap

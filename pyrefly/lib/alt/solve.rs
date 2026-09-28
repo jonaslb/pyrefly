@@ -1199,6 +1199,48 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 vec![iterable]
             }
+            // Iterate each case separately so every produced type stays indexed by its case. When
+            // every case is a fixed-length tuple of the same length, positions are kept distinct.
+            Type::QuantifiedCases(cases) => {
+                let per_case: Vec<Vec<Iterable>> = cases
+                    .cases()
+                    .iter()
+                    .map(|case| self.iterate(case, range, errors, orig_context))
+                    .collect();
+                let fixed: Option<Vec<&Vec<Type>>> = per_case
+                    .iter()
+                    .map(|iterables| match iterables.as_slice() {
+                        [Iterable::FixedLen(elts)] => Some(elts),
+                        _ => None,
+                    })
+                    .collect();
+                match fixed {
+                    Some(fixed) if fixed.iter().all(|elts| elts.len() == fixed[0].len()) => {
+                        let positions = (0..fixed[0].len())
+                            .map(|i| {
+                                cases.with_cases(fixed.iter().map(|elts| elts[i].clone()).collect())
+                            })
+                            .collect();
+                        vec![Iterable::FixedLen(positions)]
+                    }
+                    // Keep every case's shape when the cases don't align, so unpacking still checks
+                    // each case's arity. Labeling is only used when no shape would be discarded.
+                    _ if per_case
+                        .iter()
+                        .all(|iterables| matches!(iterables.as_slice(), [Iterable::OfType(_)])) =>
+                    {
+                        vec![Iterable::OfType(
+                            cases.with_cases(
+                                per_case
+                                    .into_iter()
+                                    .map(|iterables| self.get_produced_type(iterables))
+                                    .collect(),
+                            ),
+                        )]
+                    }
+                    _ => per_case.into_iter().flatten().collect(),
+                }
+            }
             _ => {
                 let ty = self
                     .unwrap_iterable(iterable)

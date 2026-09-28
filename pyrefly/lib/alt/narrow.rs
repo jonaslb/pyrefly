@@ -1376,6 +1376,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         range: TextRange,
         errors: &ErrorCollector,
     ) -> Type {
+        // Narrowing a value that depends on a constrained type variable's solution narrows each
+        // case independently, so the result stays correlated with the type variable. A case
+        // narrowed to `Never` records that the branch is unreachable under that constraint.
+        if let Type::QuantifiedCases(cases) = ty {
+            return cases.with_cases(
+                cases
+                    .cases()
+                    .iter()
+                    .map(|case| self.atomic_narrow(case, op, range, errors))
+                    .collect(),
+            );
+        }
         match op {
             AtomicNarrowOp::Placeholder => ty.clone(),
             AtomicNarrowOp::ClassCoverageGate(_) => ty.clone(),

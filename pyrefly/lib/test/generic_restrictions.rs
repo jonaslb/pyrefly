@@ -1771,3 +1771,98 @@ def bad() -> None:
     x: Nested[list[Any]] = Nested([1])  # Should be an error
  "#,
 );
+
+testcase!(
+    test_constrained_method_intermediate_result,
+    r#"
+from typing import assert_type
+class DataFrame:
+    def group_by(self) -> DataFrameGroup: ...
+class LazyFrame:
+    def group_by(self) -> LazyFrameGroup: ...
+class DataFrameGroup:
+    def agg(self) -> DataFrame: ...
+class LazyFrameGroup:
+    def agg(self) -> LazyFrame: ...
+def named[Frame: (DataFrame, LazyFrame)](df: Frame) -> Frame:
+    grouped = df.group_by()
+    assert_type(grouped.agg(), Frame)
+    return grouped.agg()
+def chained[Frame: (DataFrame, LazyFrame)](df: Frame) -> Frame:
+    return df.group_by().agg()
+    "#,
+);
+
+testcase!(
+    test_constrained_method_self_return,
+    r#"
+from typing import Self, assert_type
+class DataFrame:
+    def copy(self) -> Self: ...
+class LazyFrame:
+    def copy(self) -> Self: ...
+def f[Frame: (DataFrame, LazyFrame)](df: Frame) -> Frame:
+    assert_type(df.copy(), Frame)
+    return df.copy()
+    "#,
+);
+
+testcase!(
+    test_constrained_intermediate_negatives,
+    r#"
+class DataFrame:
+    def group_by(self) -> DataFrameGroup: ...
+class LazyFrame:
+    def group_by(self) -> LazyFrameGroup: ...
+class DataFrameGroup:
+    def agg(self) -> DataFrame: ...
+    def merge(self, other: DataFrameGroup) -> None: ...
+    def only_eager(self) -> None: ...
+class LazyFrameGroup:
+    def agg(self) -> LazyFrame: ...
+    def merge(self, other: LazyFrameGroup) -> None: ...
+def cross_kind[Frame: (DataFrame, LazyFrame)](df: Frame):
+    grouped = df.group_by()
+    grouped.merge(DataFrame().group_by())  # E: not assignable
+    grouped.only_eager()  # E: no attribute
+def flow_merge[Frame: (DataFrame, LazyFrame)](df: Frame, cond: bool) -> Frame:
+    if cond:
+        grouped = df.group_by()
+    else:
+        grouped = DataFrameGroup()
+    return grouped.agg()  # E: not assignable
+    "#,
+);
+
+testcase!(
+    test_constrained_inferred_return_cases_at_call_site,
+    r#"
+from typing import assert_type
+class DataFrame:
+    def group_by(self) -> DataFrameGroup: ...
+class LazyFrame:
+    def group_by(self) -> LazyFrameGroup: ...
+class DataFrameGroup: ...
+class LazyFrameGroup: ...
+def group[Frame: (DataFrame, LazyFrame)](df: Frame):
+    return df.group_by()
+assert_type(group(DataFrame()), DataFrameGroup)
+    "#,
+);
+
+// `isinstance(x, B)` does not establish `T = B`: under `T = A`, `x` may be a
+// `C`, whose `m` is `A.m` and returns `B` rather than `T`.
+testcase!(
+    test_constrained_narrowed_multiple_inheritance_method_return,
+    r#"
+class A:
+    def m(self) -> B: ...
+class B:
+    def m(self) -> B: ...
+class C(A, B): ...
+def f[T: (A, B)](x: T) -> T:
+    if isinstance(x, B):
+        return x.m()  # E: not assignable
+    return x
+    "#,
+);

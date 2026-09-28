@@ -146,6 +146,8 @@ pub enum CallTarget {
     BoundMethodOverload(Type, Vec1<TargetWithTParams<Function>>, FuncMetadata),
     /// A union of call targets.
     Union(Vec<CallTarget>),
+    /// Call targets indexed by the declared constraints of one quantified.
+    QuantifiedCases(Quantified, Vec<CallTarget>),
     /// Any, as a call target.
     Any(AnyStyle),
 }
@@ -600,6 +602,35 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     CallTargetLookup::Ok(Box::new(CallTarget::Union(targets)))
                 }
             }
+            Type::QuantifiedCases(cases) => {
+                let original = Type::QuantifiedCases(cases.clone());
+                // A pending choice cannot be carried by a call target, so it is resolved if its
+                // selector has been solved and otherwise approximated by the union of its cases.
+                let cases = match self.solver().expand(original.clone()) {
+                    Type::QuantifiedCases(cases) => cases,
+                    resolved => return self.as_call_target_impl(resolved, quantified),
+                };
+                let (q, cases) = match cases.into_selected_parts() {
+                    Ok(parts) => parts,
+                    Err(resolved) => return self.as_call_target_impl(resolved, quantified),
+                };
+                let mut targets = Vec::with_capacity(cases.len());
+                for case in cases {
+                    // A `Never` case is unreachable under its constraint, for example after
+                    // narrowing, so it is the empty union of targets and its result is `Never`.
+                    if case.is_never() {
+                        targets.push(CallTarget::Union(Vec::new()));
+                        continue;
+                    }
+                    match self.as_call_target_impl(case, quantified.clone()) {
+                        CallTargetLookup::Ok(target) => targets.push(*target),
+                        CallTargetLookup::Error(..) | CallTargetLookup::CircularCall(..) => {
+                            return CallTargetLookup::Error(original, Vec::new());
+                        }
+                    }
+                }
+                CallTargetLookup::Ok(Box::new(CallTarget::QuantifiedCases(q, targets)))
+            }
             Type::Overloaded(branches) => {
                 let original = Type::Overloaded(branches.clone());
                 let mut callables = Vec::with_capacity(branches.len());
@@ -806,18 +837,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 Restriction::Constraints(constraints) => {
                     let mut targets = Vec::new();
                     for constraint in constraints {
-                        if let CallTargetLookup::Ok(target) = self.as_call_target_impl(
-                            constraint.clone(),
-                            Some(q.clone().with_restriction(Restriction::Constraints(vec![
-                                constraint.clone(),
-                            ]))),
-                        ) {
+                        if let CallTargetLookup::Ok(target) =
+                            self.as_call_target_impl(constraint.clone(), None)
+                        {
                             targets.push(*target);
                         } else {
                             return CallTargetLookup::Error(Type::Quantified(q), vec![]);
                         }
                     }
-                    CallTargetLookup::Ok(Box::new(CallTarget::Union(targets)))
+                    CallTargetLookup::Ok(Box::new(CallTarget::QuantifiedCases(*q, targets)))
                 }
                 Restriction::ShapeExtension(extension) => self
                     .as_call_target_impl(
@@ -2000,6 +2028,38 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ctor_targs,
                 );
                 CallOutcome { ty, overload_table }
+            }
+            CallTarget::QuantifiedCases(quantified, targets) => {
+                let call = CallWithTypes::new();
+                let args = call.vec_call_arg(args, self, errors);
+                let keywords = call.vec_call_keyword(keywords, self, errors);
+                let case_errors = self.error_collector();
+                let results = targets
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, target)| {
+                        let hint_ty = hint.map(|hint| {
+                            hint.map_types(self, |ty| ty.specialize_quantified(&quantified, index))
+                        });
+                        self.call_infer_with_callee_range(
+                            target,
+                            &args,
+                            &keywords,
+                            arguments_range,
+                            callee_range,
+                            &case_errors,
+                            return_errors,
+                            context,
+                            HintRef::with_ty_opt(hint, hint_ty.as_ref()),
+                            None,
+                        )
+                        .ty
+                    })
+                    .collect();
+                errors.extend_case_errors(case_errors, |_| {
+                    format!("Call is invalid for some constraints of `{quantified}`")
+                });
+                CallOutcome::of_ty(Type::quantified_cases(quantified, results))
             }
             CallTarget::Union(targets) => {
                 let call = CallWithTypes::new();

@@ -83,7 +83,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 TypeFormContext::FunctionArgument,
                 errors,
             ));
-            if !b.is_error() && !self.is_equivalent(&a, &b) {
+            // Dependent cases have no annotation syntax. Their ordinary union view
+            // remains available to assertions about the public type of a value.
+            if !b.is_error() && !self.is_equivalent(&a, &b) && {
+                let ordinary = a.clone().erase_quantified_cases();
+                ordinary == a || !self.is_equivalent(&ordinary, &b)
+            } {
                 self.error(
                     errors,
                     range,

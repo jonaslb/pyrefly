@@ -3427,6 +3427,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // TODO: Handle subscription of intersections properly.
                 base = x.1;
             }
+            if let Type::QuantifiedCases(cases) = &base
+                && matches!(&*slice_ty, Type::Literal(lit) if lit.value.as_index_i64().is_some())
+            {
+                // A fixed integer index is independent of the constraint choice.
+                return cases.with_cases(cases.cases().iter().map(|case| {
+                    let mut aliases = aliases.clone();
+                    self.subscript_infer_for_type_with_key_present_inner(
+                        case,
+                        slice,
+                        range,
+                        errors,
+                        key_present,
+                        type_form_context,
+                        &mut aliases,
+                    )
+                }).collect());
+            }
             if let Type::Overloaded(branches) = &base {
                 return self.read_overloaded_branches(branches, errors, &|branch, errors| {
                     let mut aliases = aliases.clone();
@@ -3774,7 +3791,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         Some(&|| ErrorContext::Index(self.for_display(base.clone()))),
                     )
                 }
-                Type::ClassType(_) | Type::SelfType(_) => self.call_method_or_error(
+                Type::ClassType(_) | Type::SelfType(_) | Type::QuantifiedCases(_) => self.call_method_or_error(
                     &base,
                     &dunder::GETITEM,
                     range,

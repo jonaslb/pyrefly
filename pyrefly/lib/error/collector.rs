@@ -166,6 +166,80 @@ impl ErrorCollector {
         }
     }
 
+    /// Add errors collected while checking the alternative cases of one expression.
+    /// Distinct errors that share a range and kind are merged into a single error
+    /// whose header is `header` and whose details list each case's message, so that
+    /// a failure in several cases is reported once. Internal errors, soft diagnostics,
+    /// and directives are never merged.
+    pub(crate) fn extend_case_errors(
+        &self,
+        other: ErrorCollector,
+        header: impl Fn(ErrorKind) -> String,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        let mut other = other.errors.into_inner();
+        other.cleanup();
+        let mut groups: Vec<Vec<Error>> = Vec::new();
+        for err in other.items {
+            let kind = err.error_kind();
+            let group = groups
+                .iter_mut()
+                .rev()
+                .take_while(|group| group[0].range() == err.range())
+                .find(|group| group[0].error_kind() == kind);
+            if kind != ErrorKind::InternalError
+                && !kind.is_soft()
+                && !kind.is_directive()
+                && let Some(group) = group
+            {
+                group.push(err);
+            } else {
+                groups.push(vec![err]);
+            }
+        }
+        let mut errors = ModuleErrors::default();
+        for mut group in groups {
+            if group.len() == 1 {
+                errors.push(group.pop().expect("the group contains one diagnostic"));
+                continue;
+            }
+            let first = &group[0];
+            let details = group
+                .iter()
+                .map(|err| match err.msg_details() {
+                    Some(details) => {
+                        format!("{}\n  {}", err.msg_header(), details.replace('\n', "\n  "))
+                    }
+                    None => err.msg_header().to_owned(),
+                })
+                .collect();
+            let mut merged = Error::new(
+                first.module().dupe(),
+                first.range(),
+                header(first.error_kind()),
+                details,
+                first.error_kind(),
+            );
+            for err in &group {
+                for annotation in err.secondary_annotations() {
+                    if !merged.secondary_annotations().contains(annotation) {
+                        merged =
+                            merged.with_annotation(annotation.range, annotation.label.to_string());
+                    }
+                }
+                for fix in err.quick_fixes() {
+                    if !merged.quick_fixes().contains(fix) {
+                        merged = merged.with_quick_fix(fix.clone());
+                    }
+                }
+            }
+            errors.push(merged);
+        }
+        self.errors.lock().extend(errors);
+    }
+
     /// Start building an error. Returns a no-op builder if style is Never.
     pub fn error_builder(
         &self,
@@ -545,6 +619,53 @@ mod tests {
 
     fn add(errors: &ErrorCollector, range: TextRange, kind: ErrorKind, msg: String) {
         errors.error_builder(range, kind, msg).emit();
+    }
+
+    #[test]
+    fn test_case_errors_preserve_distinct_kinds_and_soft_diagnostics() {
+        let module = ModuleInfo::new(
+            ModuleName::from_str("main"),
+            ModulePath::filesystem(Path::new("main.py").to_owned()),
+            Arc::new("bad(x)".to_owned()),
+        );
+        let errors = ErrorCollector::new(module.dupe(), ErrorStyle::Delayed);
+        let cases = ErrorCollector::new(module, ErrorStyle::Delayed);
+        let range = TextRange::new(TextSize::new(0), TextSize::new(3));
+        for case in ["A", "B"] {
+            // The same kinds are interleaved, as when each constraint reports several errors.
+            for kind in [
+                ErrorKind::BadArgumentType,
+                ErrorKind::MissingAttribute,
+                ErrorKind::Deprecated,
+                ErrorKind::InternalError,
+            ] {
+                add(&cases, range, kind, format!("failure for {case}"));
+            }
+        }
+        errors.extend_case_errors(cases, |_| "Not valid for every constraint".to_owned());
+        let mut collected = errors.errors.lock();
+        collected.cleanup();
+        assert_eq!(collected.items.len(), 6);
+        for kind in [ErrorKind::BadArgumentType, ErrorKind::MissingAttribute] {
+            let merged = collected
+                .items
+                .iter()
+                .filter(|e| e.error_kind() == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(merged.len(), 1);
+            assert!(merged[0].msg().contains("failure for A"));
+            assert!(merged[0].msg().contains("failure for B"));
+        }
+        for kind in [ErrorKind::Deprecated, ErrorKind::InternalError] {
+            assert_eq!(
+                collected
+                    .items
+                    .iter()
+                    .filter(|e| e.error_kind() == kind)
+                    .count(),
+                2
+            );
+        }
     }
 
     #[test]

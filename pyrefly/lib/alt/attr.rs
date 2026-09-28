@@ -629,6 +629,57 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         context: Option<&dyn Fn() -> ErrorContext>,
         todo_ctx: &str,
     ) -> Type {
+        // These alternatives are exact type-argument choices, unlike a runtime
+        // intersection produced by narrowing an individual value. Errors from the
+        // cases are merged so that a shared failure is reported once for `base`.
+        let per_case = |members: &[Type], combine: &dyn Fn(Vec<Type>) -> Type| {
+            let case_errors = ErrorCollector::new(errors.module().dupe(), errors.style());
+            let ty = combine(
+                members
+                    .iter()
+                    .map(|member| {
+                        self.type_of_attr_get(
+                            member,
+                            attr_name,
+                            range,
+                            &case_errors,
+                            error_kind,
+                            context,
+                            todo_ctx,
+                        )
+                    })
+                    .collect(),
+            );
+            errors.extend_case_errors(case_errors, |kind| {
+                if kind == error_kind {
+                    format!(
+                        "Object of type `{}` has no attribute `{attr_name}`",
+                        self.for_display(base.clone())
+                    )
+                } else {
+                    format!(
+                        "Cannot read attribute `{attr_name}` for every constraint of `{}`",
+                        self.for_display(base.clone())
+                    )
+                }
+            });
+            ty
+        };
+        if let Some((quantified, cases)) = base.as_quantified_cases() {
+            return per_case(cases, &|tys| {
+                Type::quantified_cases(quantified.clone(), tys)
+            });
+        }
+        // Distribute over unions only when a member carries exact-choice cases, so
+        // ordinary unions keep their combined diagnostics.
+        if let Type::Union(union) = base
+            && union
+                .members
+                .iter()
+                .any(|member| member.as_quantified_cases().is_some())
+        {
+            return per_case(&union.members, &|tys| self.unions(tys));
+        }
         let attr_base = self.as_attribute_base(base.clone());
         let lookup_result = attr_base.clone().map_or_else(
             || LookupResult::internal_error(InternalError::AttributeBaseUndefined(base.clone())),
@@ -883,6 +934,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         todo_ctx: &str,
         allow_getattr_fallback: bool,
     ) -> Option<Type> {
+        if let Some((quantified, cases)) = base.as_quantified_cases() {
+            let mut results = Vec::with_capacity(cases.len());
+            for case in cases {
+                results.push(self.type_of_magic_dunder_attr(
+                    case,
+                    attr_name,
+                    range,
+                    errors,
+                    context,
+                    todo_ctx,
+                    allow_getattr_fallback,
+                )?);
+            }
+            return Some(Type::quantified_cases(quantified.clone(), results));
+        }
         let mut not_found = false;
         let mut attr_tys = Vec::new();
         let lookup_result = match self.as_attribute_base(base.clone()) {

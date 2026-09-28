@@ -2312,7 +2312,7 @@ impl<'a> CallGraphVisitor<'a> {
                         exclude_object_methods,
                     )
                 }
-                CallTarget::Union(targets) => {
+                CallTarget::Union(targets) | CallTarget::QuantifiedCases(_, targets) => {
                     if targets.is_empty() {
                         debug_println!(
                             self.debug,
